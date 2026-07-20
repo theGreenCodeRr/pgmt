@@ -150,8 +150,12 @@ def main():
         
         if local_rank == 0:
             logger.info(f"Epoch {epoch+1} Complete. Avg InfoNCE Loss: {avg_loss:.4f}")
-            # Save Checkpoint
-            torch.save(model.module.state_dict(), f"pgmt_stage1_epoch_{epoch+1}.pth")
+            
+            # create a checkpoints folder if it doesn't exist ---
+            os.makedirs("checkpoints", exist_ok=True)
+            
+            # Save Checkpoint inside the folder
+            torch.save(model.module.state_dict(), f"checkpoints/pgmt_stage1_epoch_{epoch+1}.pth")
 
     cleanup_distributed()
 

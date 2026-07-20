@@ -1,0 +1,14 @@
+name: pgmt_env
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - torch
+    - torchvision
+    - torchaudio
+    - transformers
+    - opencv-python
+    - tqdm
+    - matplotlib
