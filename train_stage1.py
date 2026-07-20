@@ -1,134 +1,159 @@
+import os
+import argparse
+import logging
+from tqdm import tqdm
+
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+# Import our custom PGMT modules
 from dataset_ntu import NTURGBD_AlignedDataset
-from architecture import PGMTDualStream
-import time
-import cv2
-import multiprocessing
+from pgmt_architecture import PGMTDualStream
 
-# --- PREVENT CPU THREAD EXPLOSION ---
-cv2.setNumThreads(0)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# --- NVIDIA AMPERE (RTX 30-SERIES) OPTIMIZATIONS ---
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
+def setup_distributed():
+    """Initializes PyTorch DDP via NCCL backend."""
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
 
-def info_nce_loss(features_a, features_b, temperature=0.07):
+def cleanup_distributed():
+    dist.destroy_process_group()
+
+def infonce_loss(features_a, features_b, temperature=0.07):
     """
-    Computes the Contrastive InfoNCE Loss between two modalities.
+    High-Capacity InfoNCE Loss.
+    Calculates an N x N similarity matrix to penalize hard negatives.
     """
-    features_a = features_a.float()
-    features_b = features_b.float()
-
-    features_a = torch.nn.functional.normalize(features_a, dim=-1, eps=1e-5)
-    features_b = torch.nn.functional.normalize(features_b, dim=-1, eps=1e-5)
+    # L2 Normalize features to the unit hypersphere
+    features_a = F.normalize(features_a, dim=-1)
+    features_b = F.normalize(features_b, dim=-1)
     
-    sim_matrix = torch.matmul(features_a, features_b.T) / temperature
-    labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
+    # Calculate similarity matrix (Batch*T x Batch*T)
+    logits = torch.matmul(features_a, features_b.T) / temperature
     
-    loss_a = nn.CrossEntropyLoss()(sim_matrix, labels)
-    loss_b = nn.CrossEntropyLoss()(sim_matrix.T, labels)
+    # Labels are the diagonal (each token matches with itself across modalities)
+    batch_size = features_a.size(0)
+    labels = torch.arange(batch_size, device=features_a.device)
+    
+    # Symmetric cross-entropy loss (Vision->Graph and Graph->Vision)
+    loss_a = F.cross_entropy(logits, labels)
+    loss_b = F.cross_entropy(logits.T, labels)
     
     return (loss_a + loss_b) / 2.0
 
-def main():
-    print("="*50)
-    print(" PGMT Phase 1: Stage 1 Alignment Training")
-    print("="*50)
+def train_epoch(model, dataloader, optimizer, accumulation_steps, local_rank):
+    model.train()
+    total_loss = 0.0
     
-    batch_size = 32  
-    num_epochs = 10
-    learning_rate = 1e-4
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Target Device: {device} (TF32 Enabled: {torch.backends.cuda.matmul.allow_tf32})")
+    # Only show progress bar on the primary GPU (Rank 0)
+    pbar = tqdm(dataloader, disable=(local_rank != 0), desc="Training")
     
-    if torch.cuda.device_count() > 1:
-        print(f"[*] Found {torch.cuda.device_count()} GPUs. DataParallel enabled.")
+    for batch_idx, batch in enumerate(pbar):
+        # 1. Move batch to the correct GPU
+        input_dict = {
+            "visual_frames_siglip": batch["visual_frames_siglip"].to(local_rank, non_blocking=True),
+            "visual_frames_dinov2": batch["visual_frames_dinov2"].to(local_rank, non_blocking=True),
+            "kinematic_streams": batch["kinematic_streams"].to(local_rank, non_blocking=True),
+            "spatial_anchors": batch["spatial_anchors"].to(local_rank, non_blocking=True)
+        }
 
-    print("[*] Initializing Dataset...")
-    dataset = NTURGBD_AlignedDataset(data_root=r"E:\datasets\ntu_rgbd")
+        # Check if we are accumulating or syncing on this step
+        is_accumulating = (batch_idx + 1) % accumulation_steps != 0 and (batch_idx + 1) != len(dataloader)
+
+        # 2. Forward & Backward Pass (with or without DDP sync)
+        # Using model.no_sync() prevents the slow PCIe communication on oniwaka during accumulation!
+        context_manager = model.no_sync() if is_accumulating else torch.cuda.amp.autocast(enabled=False) # Dummy context if syncing
+
+        with context_manager:
+            # Native Hopper bfloat16 for immense speed and stability
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(input_dict)
+                
+                v_target = outputs["info_nce_visual"]
+                g_target = outputs["info_nce_graph"]
+                
+                loss = infonce_loss(v_target, g_target)
+                loss = loss / accumulation_steps # Scale loss
+
+            loss.backward()
+
+        # 3. Optimizer Step (Only when accumulation is finished)
+        if not is_accumulating:
+            # Gradient clipping to ensure stability early in training
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            
+        total_loss += loss.item() * accumulation_steps
+        
+        if local_rank == 0:
+            pbar.set_postfix({'InfoNCE': f"{loss.item() * accumulation_steps:.4f}"})
+            
+    return total_loss / len(dataloader)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=64) # Per GPU limit for 80GB VRAM
+    parser.add_argument("--accumulation_steps", type=int, default=4) # Virtual batch = 64 * 2 GPUs * 4 steps
+    parser.add_argument("--lr", type=float, default=3e-4)
+    args = parser.parse_args()
+
+    # 1. Initialize Distributed Data Parallel
+    local_rank = setup_distributed()
+    if local_rank == 0: logger.info("DDP Initialized via NCCL. Starting PGMT Stage 1 Training.")
+
+    # 2. Load Dataset (Directly from NAS)
+    dataset = NTURGBD_AlignedDataset(data_root="/pnr/lab/nurul/datasets/ntu_rgbd")
     
+    # 3. Distributed Sampler & Loader
+    # Limits num_workers to 4 per GPU (8 total) to protect oniwaka's 94GB system RAM
+    sampler = DistributedSampler(dataset)
     dataloader = DataLoader(
         dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=2, 
-        prefetch_factor=2, 
-        pin_memory=False, 
-        persistent_workers=True
+        batch_size=args.batch_size, 
+        sampler=sampler, 
+        num_workers=4, 
+        pin_memory=True,
+        drop_last=True
     )
-    
-    if len(dataset) == 0:
-        print("[!] No data found. Exiting training loop.")
-        return
 
-    print("[*] Initializing Architecture...")
-    model = PGMTDualStream(stage1_pretraining=True)
+    # 4. Build Model & Move to DDP
+    model = PGMTDualStream(vis_dim=1024, stage1_pretraining=True).to(local_rank)
     
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    # PyTorch 2.x Compilation for H100 FlashAttention integration
+    if local_rank == 0: logger.info("Compiling model for Hopper Architecture (This takes ~1 min)...")
+    model = torch.compile(model)
+    
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    # 5. Optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+
+    # 6. Training Loop
+    for epoch in range(args.epochs):
+        sampler.set_epoch(epoch) # Crucial for data shuffling in DDP
         
-    model.to(device)
-    
-    print("[*] Compiling model with torch.compile() for max speed...")
-    try:
-        model = torch.compile(model)
-    except Exception as e:
-        print(f"[!] Warning: torch.compile() failed or not supported. ({e})")
-    
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate, weight_decay=1e-4)
-    scaler = torch.amp.GradScaler('cuda')
-    
-    print("\n[*] Commencing Training...")
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_loss = 0.0
-        valid_batches = 0 # Track only successful batches for the average
-        start_time = time.time()
+        if local_rank == 0: logger.info(f"--- Epoch {epoch+1}/{args.epochs} ---")
         
-        for batch_idx, batch in enumerate(dataloader):
-            batch_gpu = {
-                "visual_frames": batch["visual_frames"].to(device, non_blocking=True),
-                "kinematic_windows": batch["kinematic_windows"].to(device, non_blocking=True),
-                "spatial_anchors": batch["spatial_anchors"].to(device, non_blocking=True)
-            }
-            
-            optimizer.zero_grad(set_to_none=True)
-            
-            with torch.amp.autocast('cuda'):
-                outputs = model(batch_gpu)
-                loss = info_nce_loss(outputs["info_nce_visual"], outputs["info_nce_graph"])
-                
-            # --- THE NaN INTERCEPTOR ---
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"[!] Warning: Dropped Batch [{batch_idx}/{len(dataloader)}] due to corrupted NTU coordinates (NaN/Inf).")
-                continue # Skip backprop and prevent it from ruining epoch_loss
-                
-            scaler.scale(loss).backward()
-            
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            scaler.step(optimizer)
-            scaler.update()
-            
-            epoch_loss += loss.item()
-            valid_batches += 1
-            
-            if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch+1}/{num_epochs}] | Batch [{batch_idx}/{len(dataloader)}] | Loss: {loss.item():.4f}")
-                
-        # Safely compute average only using valid batches
-        avg_loss = epoch_loss / max(1, valid_batches)
-        epoch_time = time.time() - start_time
-        print(f"\n>> End of Epoch {epoch+1} | Avg Loss: {avg_loss:.4f} | Valid Batches: {valid_batches}/{len(dataloader)} | Time: {epoch_time:.2f}s\n")
+        avg_loss = train_epoch(model, dataloader, optimizer, args.accumulation_steps, local_rank)
         
-        torch.save(model.state_dict(), f"pgmt_stage1_epoch{epoch+1}.pth")
-        print(f"[*] Checkpoint saved: pgmt_stage1_epoch{epoch+1}.pth\n")
+        if local_rank == 0:
+            logger.info(f"Epoch {epoch+1} Complete. Avg InfoNCE Loss: {avg_loss:.4f}")
+            # Save Checkpoint
+            torch.save(model.module.state_dict(), f"pgmt_stage1_epoch_{epoch+1}.pth")
+
+    cleanup_distributed()
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
     main()
