@@ -1,9 +1,17 @@
+import os
+os.environ["HF_HOME"] = "/pnr/lab/nurul/PGMT_Code/hf_cache"
+os.environ["TORCH_HOME"] = "/pnr/lab/nurul/PGMT_Code/torch_cache"
+os.makedirs("/pnr/lab/nurul/PGMT_Code/hf_cache", exist_ok=True)
+os.makedirs("/pnr/lab/nurul/PGMT_Code/torch_cache", exist_ok=True)
+os.makedirs("/pnr/lab/nurul/PGMT_Code/logs", exist_ok=True)
+os.makedirs("/pnr/lab/nurul/PGMT_Code/checkpoints", exist_ok=True)
+
+import glob
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from dataset_ntu import NTURGBD_AlignedDataset
 from pgmt_architecture import PGMTDualStream
-import os
 
 def load_model_weights(model, checkpoint_path):
     """Safely loads weights, stripping the '_orig_mod.' and 'module.' prefixes from DDP/Compile."""
@@ -39,18 +47,32 @@ def main():
     print("="*60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_file = "pgmt_stage1_epoch_1.pth" # Update this to your desired epoch
-
-    if not os.path.exists(checkpoint_file):
-        print(f"[!] Cannot find {checkpoint_file}. Wait for the training epoch to finish!")
+    
+    # --- AUTO-CHECKPOINT FINDER ---
+    checkpoint_dir = "checkpoints"
+    if not os.path.exists(checkpoint_dir):
+        print(f"[!] Cannot find '{checkpoint_dir}/' folder. Wait for the training epoch to finish!")
         return
+        
+    # Dynamically find and sort all epoch checkpoints
+    checkpoints = sorted(
+        glob.glob(os.path.join(checkpoint_dir, "pgmt_stage1_epoch_*.pth")), 
+        key=lambda x: int(os.path.basename(x).split('epoch_')[1].split('.')[0])
+    )
+    
+    if not checkpoints:
+        print(f"[!] No .pth files found in {checkpoint_dir}/")
+        return
+        
+    checkpoint_file = checkpoints[-1] # Automatically grab the latest epoch
+    print(f"[*] Found {len(checkpoints)} checkpoints. Using the latest: {checkpoint_file}")
 
     # 1. Initialize Dataset
     print("[*] Loading NTU Dataset...")
     dataset = NTURGBD_AlignedDataset(data_root="/pnr/lab/nurul/datasets/ntu_rgbd")
     
-    # We can use a large batch size here since we aren't accumulating gradients
-    dataloader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=4)
+    # Lowered batch size to 32 and workers to 2 for safe single-GPU processing
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=2)
 
     # 2. Initialize Model
     print(f"[*] Loading Weights from {checkpoint_file}...")
@@ -61,7 +83,8 @@ def main():
     all_visual_features = []
     all_graph_features = []
     
-    num_eval_batches = 10 # Testing 1,280 continuous video sequences (128 * 10)
+    # Testing 1,280 continuous video sequences (32 batch_size * 40 batches = 1280 pool)
+    num_eval_batches = 40 
     
     print(f"[*] Extracting Features for Retrieval Pool ({num_eval_batches} batches)...")
     with torch.no_grad():
@@ -76,15 +99,15 @@ def main():
                 "spatial_anchors": batch["spatial_anchors"].to(device)
             }
             
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 outputs = model(batch_gpu)
                 
             vis_feat = outputs["info_nce_visual"]
             graph_feat = outputs["info_nce_graph"]
             
-            # L2 Normalize the features for Cosine Similarity
-            vis_feat = F.normalize(vis_feat.float(), dim=-1)
-            graph_feat = F.normalize(graph_feat.float(), dim=-1)
+            # L2 Normalize the features for Cosine Similarity (Anti-NaN Guarded)
+            vis_feat = F.normalize(vis_feat.float(), dim=-1, eps=1e-8)
+            graph_feat = F.normalize(graph_feat.float(), dim=-1, eps=1e-8)
             
             all_visual_features.append(vis_feat)
             all_graph_features.append(graph_feat)

@@ -5,3 +5,5 @@ tmp/
 checkpoints/
 output/
 logs/
+hf_cache/
+torch_cache/

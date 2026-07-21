@@ -90,7 +90,7 @@ class MS_HyperTR(nn.Module):
         self.spatial_pos = nn.Parameter(torch.randn(1, 1, 1, 1, num_nodes, hidden_dim))
         
         # Master Transformer Encoder 
-        # (Uses FlashAttention natively if torch.amp is enabled on H100)
+        # (Uses FlashAttention natively if torch.amp is enabled on GPU)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, 
             nhead=num_heads, 
@@ -211,6 +211,11 @@ class PGMTDualStream(nn.Module):
         self.norm_kv = nn.LayerNorm(vis_dim)
         self.cross_attn = DirectCrossAttention(embed_dim=vis_dim)
         
+        # =======================================================
+        # The Learnable Contrastive Temperature Parameter
+        # =======================================================
+        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
+        
         if not self.stage1_pretraining:
             self.llm_proj = nn.Linear(vis_dim, llm_dim)
 
@@ -240,6 +245,7 @@ class PGMTDualStream(nn.Module):
         
         # --- InfoNCE Target Extraction ---
         flat_anchors = batch["spatial_anchors"][:, :, 0, :].contiguous().view(B * T, 2)
+        
         # Using 24x24 grid resolution
         patch_x = (flat_anchors[:, 0] * 24).clamp(0, 23).long()
         patch_y = (flat_anchors[:, 1] * 24).clamp(0, 23).long()
@@ -249,6 +255,17 @@ class PGMTDualStream(nn.Module):
         target_visual_key = k_flat[batch_indices, patch_idx, :] # (B*T, vis_dim)
         contrastive_graph = q_flat.mean(dim=1) # Average the 4 queries
         
+        # =======================================================
+        # NaN SAFEGUARDS IMPLEMENTED HERE
+        # =======================================================
+        # 1. Force FP32 & explicitly add eps=1e-8 to prevent Division by Zero!
+        target_visual_key = F.normalize(target_visual_key.float(), p=2, dim=-1, eps=1e-8)
+        contrastive_graph = F.normalize(contrastive_graph.float(), p=2, dim=-1, eps=1e-8)
+        
+        # 2. Clamp temperature to prevent extreme multipliers (Logit Overflow)
+        self.logit_scale.data.clamp_(0, 4.6052) 
+        # =======================================================
+        
         llm_aligned_tokens = None
         if not self.stage1_pretraining:
             llm_aligned_tokens = self.llm_proj(grounded_tokens).view(B, T * 4, -1)
@@ -256,5 +273,6 @@ class PGMTDualStream(nn.Module):
         return {
             "llm_aligned_tokens": llm_aligned_tokens,
             "info_nce_visual": target_visual_key,
-            "info_nce_graph": contrastive_graph
+            "info_nce_graph": contrastive_graph,
+            "logit_scale": self.logit_scale.exp()  # Export clamped scale for safe loss calculation
         }

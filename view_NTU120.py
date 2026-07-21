@@ -6,7 +6,7 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 
 # Configuration
-BASE_DIR = r"E:\datasets\ntu_rgbd"
+BASE_DIR = r"/pnr/lab/nurul/datasets/ntu_rgbd" 
 RGB_DIR = os.path.join(BASE_DIR, "rgb")
 SKELETON_DIR = os.path.join(BASE_DIR, "skeleton")
 

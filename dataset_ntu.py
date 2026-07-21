@@ -189,9 +189,19 @@ class NTURGBD_AlignedDataset(Dataset):
         
         try:
             kinematics, anchors_2d = self._parse_ntu_skeleton(sample_info['skeleton_path'])
+            
+            # 🛡️ THE NAN INTERCEPTOR 🛡️
+            # NTU RGB+D Kinect sensors occasionally drop tracking and output raw NaNs.
+            # If we don't drop them here, they multiply through the network and poison the loss.
+            if torch.isnan(kinematics).any() or torch.isinf(kinematics).any():
+                raise ValueError("Corrupted Kinect Sensor Data: NaN/Inf detected in skeleton joints.")
+            if torch.isnan(anchors_2d).any() or torch.isinf(anchors_2d).any():
+                raise ValueError("Corrupted Kinect Sensor Data: NaN/Inf detected in spatial anchors.")
+                
             total_frames = kinematics.shape[0]
         except Exception as e:
-            print(f"Error parsing {sample_info['skeleton_path']}: {e}")
+            # Fallback for corrupted NTU files during training (Drops and replaces the batch)
+            # print(f"Error parsing {sample_info['skeleton_path']}: {e}") # Commented out to reduce terminal spam
             return self.__getitem__((idx + 1) % len(self.samples))
 
         anchor_indices = self._get_temporal_anchors(total_frames)
@@ -205,6 +215,7 @@ class NTURGBD_AlignedDataset(Dataset):
         for anchor in anchor_indices:
             skel_win, anchor_2d = self._extract_skeleton_window(kinematics, anchors_2d, anchor, total_frames)
             
+            # --- THE MAGIC HAPPENS HERE ---
             # Compute MS-HyperTR Physical streams (Joints, Bones, Motion)
             multi_stream_physics = self._compute_kinematic_physics(skel_win)
             
