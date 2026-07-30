@@ -75,8 +75,7 @@ class DualVisionEncoder(nn.Module):
 # =====================================================================
 class MS_HyperTR(nn.Module):
     """
-    Replaces legacy ST-GCN. Processes Joints, Bones, and Motion streams 
-    simultaneously using FlashAttention.
+    Processes Joints, Bones, and Motion streams simultaneously using FlashAttention.
     """
     def __init__(self, num_nodes=25, in_dim=3, hidden_dim=256, num_layers=4, num_heads=8):
         super().__init__()
@@ -156,28 +155,6 @@ class TemporalQueryPooler(nn.Module):
         return self.norm(pooled_out).view(B, T, self.num_queries, -1)
 
 
-class RoPE2D(nn.Module):
-    """
-    2D Rotary Positional Embeddings adapted for the 24x24 Super Token grid.
-    """
-    def __init__(self, dim, grid_h=24, grid_w=24, base=10000.0):
-        super().__init__()
-        self.grid_h = grid_h
-        self.grid_w = grid_w
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 4).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-
-    def forward(self, x):
-        pos_y = torch.arange(self.grid_h, device=x.device).repeat_interleave(self.grid_w)
-        pos_x = torch.arange(self.grid_w, device=x.device).repeat(self.grid_h)
-        sin_inp_y = torch.einsum("i,j->ij", pos_y.float(), self.inv_freq)
-        sin_inp_x = torch.einsum("i,j->ij", pos_x.float(), self.inv_freq)
-        emb_y = torch.cat((sin_inp_y.sin(), sin_inp_y.cos()), dim=-1)
-        emb_x = torch.cat((sin_inp_x.sin(), sin_inp_x.cos()), dim=-1)
-        emb = torch.cat((emb_y, emb_x), dim=-1).unsqueeze(0)
-        return x + emb 
-
-
 class DirectCrossAttention(nn.Module):
     def __init__(self, embed_dim: int):
         super().__init__()
@@ -203,9 +180,10 @@ class PGMTDualStream(nn.Module):
         self.temporal_pooler = TemporalQueryPooler(input_dim=256, embed_dim=vis_dim, num_queries=4)
         
         # Alignment & Geometry (Targeting 24x24 grid = 576 tokens)
-        self.q_proj = nn.Linear(vis_dim + 2, vis_dim) # +2 for Spine Base Anchor (X, Y)
+        # 🛡️ THE FIX IS ENFORCED: vis_dim only. NO +2 Spatial Anchor cheat sheet!
+        # 🛡️ RoPE2D HAS BEEN ABLATED AND REMOVED COMPLETELY
+        self.q_proj = nn.Linear(vis_dim, vis_dim) 
         self.k_proj = nn.Linear(vis_dim, vis_dim)
-        self.rope2d = RoPE2D(vis_dim, grid_h=24, grid_w=24)
         
         self.norm_q = nn.LayerNorm(vis_dim)
         self.norm_kv = nn.LayerNorm(vis_dim)
@@ -231,17 +209,16 @@ class PGMTDualStream(nn.Module):
         
         # 3. Geometry Setup
         v_flat = vis_tokens.view(B * T, 576, -1)
-        v_flat = self.norm_kv(self.rope2d(v_flat))
-        k_flat = self.k_proj(v_flat)
         
-        primary_anchor = batch["spatial_anchors"][:, :, 0, :] # Shape: (B, T, 2)
-        primary_anchor = primary_anchor.unsqueeze(2).expand(-1, -1, 4, -1) 
+        # 🛡️ THE FIX ENFORCED: Purely semantic normalization. No RoPE2D injection!
+        v_flat_norm = self.norm_kv(v_flat)
+        k_flat = self.k_proj(v_flat_norm)
         
         # 4. Query Grounding
-        q_concat = torch.cat([Q_graph, primary_anchor], dim=-1) 
-        q_flat = self.norm_q(self.q_proj(q_concat.view(B * T, 4, -1)))
+        # 🛡️ THE FIX ENFORCED: Project purely from graph tokens. No anchor concatenation!
+        q_flat = self.norm_q(self.q_proj(Q_graph.view(B * T, 4, -1)))
         
-        grounded_tokens = self.cross_attn(query=q_flat, key=k_flat, value=v_flat)
+        grounded_tokens = self.cross_attn(query=q_flat, key=k_flat, value=v_flat_norm)
         
         # --- InfoNCE Target Extraction ---
         flat_anchors = batch["spatial_anchors"][:, :, 0, :].contiguous().view(B * T, 2)
@@ -251,7 +228,7 @@ class PGMTDualStream(nn.Module):
         patch_y = (flat_anchors[:, 1] * 24).clamp(0, 23).long()
         patch_idx = ((patch_y * 24) + patch_x).clamp(0, 575)
         
-        batch_indices = torch.arange(B * T, device=v_flat.device)
+        batch_indices = torch.arange(B * T, device=v_flat_norm.device)
         target_visual_key = k_flat[batch_indices, patch_idx, :] # (B*T, vis_dim)
         contrastive_graph = q_flat.mean(dim=1) # Average the 4 queries
         
@@ -262,8 +239,8 @@ class PGMTDualStream(nn.Module):
         target_visual_key = F.normalize(target_visual_key.float(), p=2, dim=-1, eps=1e-8)
         contrastive_graph = F.normalize(contrastive_graph.float(), p=2, dim=-1, eps=1e-8)
         
-        # 2. Clamp temperature to prevent extreme multipliers (Logit Overflow)
-        self.logit_scale.data.clamp_(0, 4.6052) 
+        # 2. DDP-SAFE CLAMP: Functional clamp avoids in-place parameter modification errors
+        safe_logit_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
         # =======================================================
         
         llm_aligned_tokens = None
@@ -274,5 +251,5 @@ class PGMTDualStream(nn.Module):
             "llm_aligned_tokens": llm_aligned_tokens,
             "info_nce_visual": target_visual_key,
             "info_nce_graph": contrastive_graph,
-            "logit_scale": self.logit_scale.exp()  # Export clamped scale for safe loss calculation
+            "logit_scale": safe_logit_scale  # Export safely clamped scale for loss calculation
         }

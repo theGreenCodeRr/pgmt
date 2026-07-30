@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 
 class NTURGBD_AlignedDataset(Dataset):
     """
-    PGMT Phase 1 Dataset (H100 / SLURM Revision): 
+    PGMT Phase 1 Dataset (SLURM Revision): 
     Aligns sparse RGB visual frames with high-frequency kinematic skeleton windows.
     Now acts as a physics engine to compute Bones and Motion (Velocity) on the fly,
     and outputs dual-resolution images for the SigLIP+DINOv2 backbone.
@@ -190,7 +190,7 @@ class NTURGBD_AlignedDataset(Dataset):
         try:
             kinematics, anchors_2d = self._parse_ntu_skeleton(sample_info['skeleton_path'])
             
-            # 🛡️ THE NAN INTERCEPTOR 🛡️
+            # NaN INTERCEPTOR
             # NTU RGB+D Kinect sensors occasionally drop tracking and output raw NaNs.
             # If we don't drop them here, they multiply through the network and poison the loss.
             if torch.isnan(kinematics).any() or torch.isinf(kinematics).any():
@@ -215,7 +215,6 @@ class NTURGBD_AlignedDataset(Dataset):
         for anchor in anchor_indices:
             skel_win, anchor_2d = self._extract_skeleton_window(kinematics, anchors_2d, anchor, total_frames)
             
-            # --- THE MAGIC HAPPENS HERE ---
             # Compute MS-HyperTR Physical streams (Joints, Bones, Motion)
             multi_stream_physics = self._compute_kinematic_physics(skel_win)
             

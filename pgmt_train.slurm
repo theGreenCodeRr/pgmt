@@ -2,11 +2,10 @@
 #SBATCH --job-name=PGMT_GTA_FA
 #SBATCH --partition=d
 #SBATCH --nodelist=oniwaka
-#SBATCH --requeue                     # AUTO-RESTART: Automatically requeue if the node crashes
+#SBATCH --requeue
 #SBATCH --gres=gpu:2                
 #SBATCH --cpus-per-task=8            
-#SBATCH --mem=70G
-#SBATCH --time=48:00:00               
+#SBATCH --mem=70G             
 #SBATCH --output=logs/pgmt_training_%j.log   
 
 export OMP_NUM_THREADS=1
