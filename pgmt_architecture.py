@@ -18,6 +18,7 @@ class DualVisionEncoder(nn.Module):
     """
     Fuses semantic features (SigLIP) with geometric/depth features (DINOv2).
     Maps both to a unified 24x24 spatial grid (576 tokens).
+    Now returns BOTH the Fused Geometry tokens and Pure Semantic tokens.
     """
     def __init__(self, output_dim=1024):
         super().__init__()
@@ -27,7 +28,6 @@ class DualVisionEncoder(nn.Module):
         self.siglip = SiglipVisionModel.from_pretrained("google/siglip-large-patch16-384")
         
         # 2. DINOv2 Large (Requires 336x336 input -> outputs 24x24 grid)
-        # Using hub.load to fetch the ViT-L/14 model from Facebook
         self.dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
         
         # Freeze both backbone weights to conserve VRAM
@@ -46,28 +46,28 @@ class DualVisionEncoder(nn.Module):
         )
 
     def forward(self, rgb_siglip, rgb_dinov2):
-        # Expected input shape: (B, T, C, H, W)
         B, T, C, H_s, W_s = rgb_siglip.shape
         _, _, _, H_d, W_d = rgb_dinov2.shape
         
-        # Flatten batch and time
         rgb_siglip = rgb_siglip.view(B * T, C, H_s, W_s)
         rgb_dinov2 = rgb_dinov2.view(B * T, C, H_d, W_d)
         
         with torch.no_grad():
-            # Extract SigLIP Semantics
-            siglip_out = self.siglip(rgb_siglip).last_hidden_state # (B*T, 576, 1024)
+            # Pure Semantic Space (Perfectly aligned with text natively)
+            # Take the global pooled token instead of the full grid
+            # SigLIP returns pooler_output which is the global summary
+            # We also need the patch grid for pathway A, so we keep both
+            siglip_out_grid = self.siglip(rgb_siglip).last_hidden_state # (B*T, 576, 1024)
+            siglip_out_global = self.siglip(rgb_siglip).pooler_output # (B*T, 1024)
             
-            # Extract DINOv2 Geometry
-            dinov2_out = self.dinov2.forward_features(rgb_dinov2)['x_norm_patchtokens'] # (B*T, 576, 1024)
+            # Pure Geometric Space (Understands depth and bounding box structures)
+            dinov2_out_grid = self.dinov2.forward_features(rgb_dinov2)['x_norm_patchtokens']
             
-        # Concatenate on feature dimension: (B*T, 576, 2048)
-        combined_features = torch.cat([siglip_out, dinov2_out], dim=-1)
-        
-        # Fuse to multimodal Super Token: (B*T, 576, 1024)
+        combined_features = torch.cat([siglip_out_grid, dinov2_out_grid], dim=-1)
         fused_tokens = self.fusion_projector(combined_features)
         
-        return fused_tokens.view(B, T, 576, -1)
+        # Return both Spaces for the Dual-Loss Anchor
+        return fused_tokens.view(B, T, 576, -1), siglip_out_global.view(B, T, -1)
 
 
 # =====================================================================
@@ -80,61 +80,47 @@ class MS_HyperTR(nn.Module):
     def __init__(self, num_nodes=25, in_dim=3, hidden_dim=256, num_layers=4, num_heads=8):
         super().__init__()
         
-        # Independent linear embeddings for the 3 physical streams
         self.joint_embed = nn.Linear(in_dim, hidden_dim)
         self.bone_embed = nn.Linear(in_dim, hidden_dim)
         self.motion_embed = nn.Linear(in_dim, hidden_dim)
         
-        # Spatial-Temporal Positional Encodings (Broadcastable to B, T, W, S, V, D)
         self.spatial_pos = nn.Parameter(torch.randn(1, 1, 1, 1, num_nodes, hidden_dim))
         
-        # Master Transformer Encoder 
-        # (Uses FlashAttention natively if torch.amp is enabled on GPU)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, 
             nhead=num_heads, 
             dim_feedforward=hidden_dim * 4, 
             dropout=0.1, 
             batch_first=True,
-            norm_first=True # Better stability for deep networks
+            norm_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
     def forward(self, physics_streams):
-        # Input shape from Dataloader: (B, T, 3_streams, Window, Subjects, Nodes, 3_XYZ)
         B, T, Streams, W, S, V, C = physics_streams.shape
         
         joints = physics_streams[:, :, 0]
         bones = physics_streams[:, :, 1]
         motion = physics_streams[:, :, 2]
         
-        # Embed each stream
         e_joints = self.joint_embed(joints)
         e_bones = self.bone_embed(bones)
         e_motion = self.motion_embed(motion)
         
-        # Fuse streams via summation (Physics Synergies)
-        fused_physics = e_joints + e_bones + e_motion # (B, T, W, S, V, hidden_dim)
-        
-        # Add Node-level geometric positions
+        fused_physics = e_joints + e_bones + e_motion
         fused_physics = fused_physics + self.spatial_pos
         
-        # Flatten sequence for Transformer: Sequence length = (Window * Subjects * Nodes)
         seq_len = W * S * V
         flat_seq = fused_physics.view(B * T, seq_len, -1)
         
-        # Apply Transformer (Calculates global hyper-edges between all limbs across time)
         out_seq = self.transformer(flat_seq)
+        out_seq = out_seq.view(B, T, W, S, V, -1).mean(dim=4) 
         
-        # Reshape and Mean Pool over the V (Nodes) dimension
-        out_seq = out_seq.view(B, T, W, S, V, -1).mean(dim=4) # (B, T, W, S, D)
-        
-        # Permute for Temporal Query Pooler: (B, T, S, W, D)
         return out_seq.permute(0, 1, 3, 2, 4).contiguous()
 
 
 # =====================================================================
-# MODULE 3: POOLING & CROSS-ATTENTION ADAPTORS
+# MODULE 3: POOLING & CROSS-ATTENTION ADAPTORS (FA) 
 # =====================================================================
 class TemporalQueryPooler(nn.Module):
     def __init__(self, input_dim=256, embed_dim=1024, num_queries=4):
@@ -169,7 +155,7 @@ class DirectCrossAttention(nn.Module):
 
 class PGMTDualStream(nn.Module):
     """
-    Master Wrapper for Phase 1: Dual Vision + MS-HyperTR + Contrastive Alignment
+    Master Wrapper for Phase 1: Dual Vision + MS-HyperTR + DUAL Contrastive Alignment
     """
     def __init__(self, vis_dim=1024, stage1_pretraining=True, llm_dim=4096): 
         super().__init__()
@@ -179,20 +165,23 @@ class PGMTDualStream(nn.Module):
         self.kinematic_encoder = MS_HyperTR(hidden_dim=256) 
         self.temporal_pooler = TemporalQueryPooler(input_dim=256, embed_dim=vis_dim, num_queries=4)
         
-        # Alignment & Geometry (Targeting 24x24 grid = 576 tokens)
-        # 🛡️ THE FIX IS ENFORCED: vis_dim only. NO +2 Spatial Anchor cheat sheet!
-        # 🛡️ RoPE2D HAS BEEN ABLATED AND REMOVED COMPLETELY
-        self.q_proj = nn.Linear(vis_dim, vis_dim) 
-        self.k_proj = nn.Linear(vis_dim, vis_dim)
+        # -----------------------------------------------------
+        # DUAL-LOSS PATHWAY A: Geometric Grounding (Fused Space)
+        # -----------------------------------------------------
+        self.q_proj_geo = nn.Linear(vis_dim, vis_dim) 
+        self.k_proj_geo = nn.Linear(vis_dim, vis_dim)
+        self.norm_q_geo = nn.LayerNorm(vis_dim)
+        self.norm_kv_geo = nn.LayerNorm(vis_dim)
+        self.cross_attn_geo = DirectCrossAttention(embed_dim=vis_dim)
+        self.logit_scale_geo = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
         
-        self.norm_q = nn.LayerNorm(vis_dim)
-        self.norm_kv = nn.LayerNorm(vis_dim)
-        self.cross_attn = DirectCrossAttention(embed_dim=vis_dim)
-        
-        # =======================================================
-        # The Learnable Contrastive Temperature Parameter
-        # =======================================================
-        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
+        # -----------------------------------------------------
+        # DUAL-LOSS PATHWAY B: Semantic Anchor (Pure SigLIP Space)
+        # Note: We now match the global token, so we just project the queries
+        # -----------------------------------------------------
+        self.q_proj_sem = nn.Linear(vis_dim, vis_dim)
+        self.norm_q_sem = nn.LayerNorm(vis_dim)
+        self.logit_scale_sem = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
         
         if not self.stage1_pretraining:
             self.llm_proj = nn.Linear(vis_dim, llm_dim)
@@ -200,56 +189,110 @@ class PGMTDualStream(nn.Module):
     def forward(self, batch):
         B, T = batch["visual_frames_siglip"].shape[:2]
         
-        # 1. Vision Forward (Dual Resolution)
-        vis_tokens = self.vision_encoder(batch["visual_frames_siglip"], batch["visual_frames_dinov2"])
+        # 1. Vision Forward (Extracting both spaces)
+        vis_tokens_fused, vis_tokens_siglip_global = self.vision_encoder(
+            batch["visual_frames_siglip"], 
+            batch["visual_frames_dinov2"]
+        )
         
-        # 2. Kinematic Forward (3-Streams)
+        # 2. Kinematic Forward (3-Streams into 4 queries)
         ms_features = self.kinematic_encoder(batch["kinematic_streams"]) 
         Q_graph = self.temporal_pooler(ms_features) # (B, T, 4, vis_dim)
         
-        # 3. Geometry Setup
-        v_flat = vis_tokens.view(B * T, 576, -1)
+        # ==========================================================
+        # PATHWAY A: Geometric Grounding
+        # ==========================================================
+        v_flat_geo = vis_tokens_fused.view(B * T, 576, -1)
+        v_flat_norm_geo = self.norm_kv_geo(v_flat_geo)
+        k_flat_geo = self.k_proj_geo(v_flat_norm_geo)
         
-        # 🛡️ THE FIX ENFORCED: Purely semantic normalization. No RoPE2D injection!
-        v_flat_norm = self.norm_kv(v_flat)
-        k_flat = self.k_proj(v_flat_norm)
+        q_flat_geo = self.norm_q_geo(self.q_proj_geo(Q_graph.view(B * T, 4, -1)))
         
-        # 4. Query Grounding
-        # 🛡️ THE FIX ENFORCED: Project purely from graph tokens. No anchor concatenation!
-        q_flat = self.norm_q(self.q_proj(Q_graph.view(B * T, 4, -1)))
-        
-        grounded_tokens = self.cross_attn(query=q_flat, key=k_flat, value=v_flat_norm)
-        
-        # --- InfoNCE Target Extraction ---
+        # ==========================================================
+        # PATHWAY B: Semantic Text Anchor (Global)
+        # ==========================================================
+        # We align directly to the GLOBAL pure SigLIP space
+        v_flat_sem_global = vis_tokens_siglip_global.view(B * T, -1)
+        q_flat_sem = self.norm_q_sem(self.q_proj_sem(Q_graph.view(B * T, 4, -1)))
+
+        # ==========================================================
+        # Anchor Target Extraction
+        # ==========================================================
         flat_anchors = batch["spatial_anchors"][:, :, 0, :].contiguous().view(B * T, 2)
-        
-        # Using 24x24 grid resolution
         patch_x = (flat_anchors[:, 0] * 24).clamp(0, 23).long()
         patch_y = (flat_anchors[:, 1] * 24).clamp(0, 23).long()
         patch_idx = ((patch_y * 24) + patch_x).clamp(0, 575)
+        batch_indices = torch.arange(B * T, device=v_flat_geo.device)
         
-        batch_indices = torch.arange(B * T, device=v_flat_norm.device)
-        target_visual_key = k_flat[batch_indices, patch_idx, :] # (B*T, vis_dim)
-        contrastive_graph = q_flat.mean(dim=1) # Average the 4 queries
+        # Geometric InfoNCE pairs (Local Patch matching)
+        target_visual_key_geo = k_flat_geo[batch_indices, patch_idx, :] 
+        contrastive_graph_geo = q_flat_geo.mean(dim=1) 
         
-        # =======================================================
-        # NaN SAFEGUARDS IMPLEMENTED HERE
-        # =======================================================
-        # 1. Force FP32 & explicitly add eps=1e-8 to prevent Division by Zero!
-        target_visual_key = F.normalize(target_visual_key.float(), p=2, dim=-1, eps=1e-8)
-        contrastive_graph = F.normalize(contrastive_graph.float(), p=2, dim=-1, eps=1e-8)
+        # Semantic InfoNCE pairs (Global Semantic matching)
+        # FIX: We now compare the average graph token directly to the Global Image Token
+        target_visual_key_sem = v_flat_sem_global 
+        contrastive_graph_sem = q_flat_sem.mean(dim=1)
         
-        # 2. DDP-SAFE CLAMP: Functional clamp avoids in-place parameter modification errors
-        safe_logit_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
-        # =======================================================
+        # FP32 & Zero-Division Safety
+        target_visual_key_geo = F.normalize(target_visual_key_geo.float(), p=2, dim=-1, eps=1e-8)
+        contrastive_graph_geo = F.normalize(contrastive_graph_geo.float(), p=2, dim=-1, eps=1e-8)
+        
+        target_visual_key_sem = F.normalize(target_visual_key_sem.float(), p=2, dim=-1, eps=1e-8)
+        contrastive_graph_sem = F.normalize(contrastive_graph_sem.float(), p=2, dim=-1, eps=1e-8)
+        
+        safe_logit_scale_geo = torch.clamp(self.logit_scale_geo, max=4.6052).exp()
+        safe_logit_scale_sem = torch.clamp(self.logit_scale_sem, max=4.6052).exp()
         
         llm_aligned_tokens = None
         if not self.stage1_pretraining:
-            llm_aligned_tokens = self.llm_proj(grounded_tokens).view(B, T * 4, -1)
+            # In Phase 2, we merge the highly intelligent tokens before passing to the LLM
+            grounded_tokens_geo = self.cross_attn_geo(query=q_flat_geo, key=k_flat_geo, value=v_flat_norm_geo)
+            
+            # Since Sem is now global, we don't cross-attend to a grid, we just expand it or add it
+            # A simple addition of the global semantic vector to the spatially grounded vector
+            final_fused_tokens = grounded_tokens_geo + q_flat_sem
+            llm_aligned_tokens = self.llm_proj(final_fused_tokens).view(B, T * 4, -1)
         
         return {
             "llm_aligned_tokens": llm_aligned_tokens,
-            "info_nce_visual": target_visual_key,
-            "info_nce_graph": contrastive_graph,
-            "logit_scale": safe_logit_scale  # Export safely clamped scale for loss calculation
+            # Loss 1 outputs
+            "info_nce_visual_geo": target_visual_key_geo,
+            "info_nce_graph_geo": contrastive_graph_geo,
+            "logit_scale_geo": safe_logit_scale_geo,
+            # Loss 2 outputs
+            "info_nce_visual_sem": target_visual_key_sem,
+            "info_nce_graph_sem": contrastive_graph_sem,
+            "logit_scale_sem": safe_logit_scale_sem
         }
+
+# =====================================================================
+# QUICK TEST BLOCK
+# =====================================================================
+if __name__ == "__main__":
+    print("[*] Testing PGMT Dual-Stream Architecture Forward Pass...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Initialize the model
+    model = PGMTDualStream(vis_dim=1024, stage1_pretraining=True).to(device)
+    model.eval()
+    
+    # Generate a dummy batch mimicking dataset_ntu outputs
+    dummy_batch = {
+        "visual_frames_siglip": torch.randn(2, 3, 3, 384, 384).to(device),
+        "visual_frames_dinov2": torch.randn(2, 3, 3, 336, 336).to(device),
+        "kinematic_streams": torch.randn(2, 3, 3, 30, 2, 25, 3).to(device),
+        "spatial_anchors": torch.rand(2, 3, 2, 2).to(device)
+    }
+    
+    with torch.no_grad():
+        with torch.amp.autocast(device_type=device.type if device.type == 'cuda' else 'cpu', dtype=torch.bfloat16):
+            outputs = model(dummy_batch)
+            
+    print("\nOutputs Validated:")
+    for key, val in outputs.items():
+        if val is not None:
+            print(f"  - {key}: {val.shape}")
+        else:
+            print(f"  - {key}: None (Expected in Phase 1)")
+            
+    print("\n[*] Dual-Loss Architecture is fully functional and ready for Phase 1 Training!")

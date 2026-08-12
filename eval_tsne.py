@@ -1,4 +1,5 @@
 import os
+import csv
 # CACHE FIX: Force HF, PyTorch, AND Matplotlib to use local folders
 os.environ["HF_HOME"] = "/pnr/lab/nurul/PGMT_Code/hf_cache"
 os.environ["TORCH_HOME"] = "/pnr/lab/nurul/PGMT_Code/torch_cache"
@@ -39,12 +40,13 @@ def load_model_weights(model, checkpoint_path):
     for k, v in state_dict.items():
         clean_k = k.replace('_orig_mod.', '').replace('module.', '')
         clean_state_dict[clean_k] = v
-    model.load_state_dict(clean_state_dict)
+    # strict=False allows us to load the tiny 20MB file while keeping Google/Meta backbones frozen
+    model.load_state_dict(clean_state_dict, strict=False)
     return model
 
 def main():
     print("="*65)
-    print(" PGMT Phase 1: t-SNE Latent Space Clustering (X-Sub)")
+    print(" PGMT Phase 1: t-SNE Semantic Latent Space Export (X-Sub)")
     print("="*65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,7 +107,8 @@ def main():
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 outputs = model(batch_gpu)
                 
-            graph_feat = outputs["info_nce_graph"] # (B_filtered * T, 1024)
+            # EXPLICITLY EVALUATE THE SEMANTIC SPACE for clean Action Clustering
+            graph_feat = outputs["info_nce_graph_sem"] # (B_filtered * T, 1024)
             
             # Pool across the Time dimension to get 1 embedding per video
             graph_feat = graph_feat.view(B_filtered, T, -1).mean(dim=1) # Shape: (B_filtered, 1024)
@@ -125,10 +128,10 @@ def main():
     print("[*] Running t-SNE dimensionality reduction (1024D -> 2D)... This may take a minute.")
     
     # 3. Run t-SNE
-    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
+    tsne = TSNE(n_components=2, perplexity=30, max_iter=1000, random_state=42)
     X_2d = tsne.fit_transform(X)
     
-    # 4. Generate Plot
+    # 4. Generate Plot (Quick Review PNG)
     print("[*] Plotting Graph Clusters...")
     plt.figure(figsize=(12, 10))
     
@@ -147,18 +150,33 @@ def main():
             s=80
         )
         
-    plt.title(f"PGMT Spatial Grounding: MS-HyperTR Latent Space (Epoch {epoch_num})", fontsize=16, pad=15)
+    plt.title(f"PGMT Semantic Grounding: MS-HyperTR Latent Space (Epoch {epoch_num})", fontsize=16, pad=15)
     plt.xlabel("t-SNE Dimension 1", fontsize=12)
     plt.ylabel("t-SNE Dimension 2", fontsize=12)
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=12)
     plt.grid(True, linestyle='--', alpha=0.3)
     plt.tight_layout()
     
-    save_path = f"outputs/tsne_clustering_epoch_{epoch_num}.png"
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    png_path = f"outputs/tsne_clustering_epoch_{epoch_num}.png"
+    plt.savefig(png_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"[*] SUCCESS! t-SNE Plot saved to: {save_path}")
+    # 5. Export Raw Data to CSV (For Publication/External tools)
+    csv_path = f"outputs/tsne_clustering_epoch_{epoch_num}.csv"
+    print(f"[*] Exporting raw coordinate data to CSV...")
+    
+    with open(csv_path, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["X_Coordinate", "Y_Coordinate", "Label_ID", "Class_Name"])
+        for idx in range(X_2d.shape[0]):
+            x_coord = X_2d[idx, 0]
+            y_coord = X_2d[idx, 1]
+            label_id = y[idx]
+            class_name = TARGET_CLASSES[label_id]
+            writer.writerow([x_coord, y_coord, label_id, class_name])
+            
+    print(f"[*] SUCCESS! Quick-Review PNG saved to: {png_path}")
+    print(f"[*] SUCCESS! Raw Data CSV saved to: {csv_path}")
     print("="*65)
 
 if __name__ == "__main__":

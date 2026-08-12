@@ -1,4 +1,5 @@
 import os
+import argparse
 # CACHE FIX: Force Hugging Face and PyTorch Hub to use local folders
 os.environ["HF_HOME"] = "/pnr/lab/nurul/PGMT_Code/hf_cache"
 os.environ["TORCH_HOME"] = "/pnr/lab/nurul/PGMT_Code/torch_cache"
@@ -7,6 +8,7 @@ import glob
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
 from dataset_ntu_eval import NTURGBD_EvalDataset
 from pgmt_architecture import PGMTDualStream
 
@@ -21,26 +23,60 @@ def load_model_weights(model, checkpoint_path):
         if clean_k.startswith('module.'):
             clean_k = clean_k.replace('module.', '', 1)
         clean_state_dict[clean_k] = v
-    model.load_state_dict(clean_state_dict)
+    # strict=False allows us to load the tiny 20MB file while keeping Google/Meta backbones frozen
+    model.load_state_dict(clean_state_dict, strict=False)
     return model
 
-def calculate_topk_accuracy(sim_matrix, topk=(1, 5, 10)):
-    """Computes Top-K retrieval accuracy from an N x N similarity matrix."""
-    N = sim_matrix.shape[0]
-    target_labels = torch.arange(N, device=sim_matrix.device)
+def compute_chunked_retrieval(query_pool, target_pool, topk=(1, 5, 10), chunk_size=2048):
+    """
+    Memory-Safe Top-K Retrieval.
+    Calculates the N x N similarity matrix in chunks to prevent VRAM OOM errors
+    when evaluating massive datasets.
+    """
+    N = query_pool.shape[0]
+    device = query_pool.device
+    max_k = max(topk)
     
-    accuracies = {}
-    for k in topk:
-        _, topk_indices = sim_matrix.topk(k, dim=-1, largest=True, sorted=True)
-        correct = topk_indices.eq(target_labels.view(-1, 1).expand_as(topk_indices))
-        acc = correct.sum().item() / N
-        accuracies[f"Top-{k}"] = acc * 100.0
+    correct_counts = {k: 0 for k in topk}
+    total_pos_sim = 0.0
+    total_neg_sim = 0.0
+    
+    # Process the similarity matrix in vertical slices (chunks)
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        query_chunk = query_pool[i:end] # Shape: (Chunk, 1024)
         
-    return accuracies
+        # Calculate similarity for just this chunk -> Shape: (Chunk, N)
+        sim_chunk = torch.matmul(query_chunk, target_pool.T)
+        
+        # 1. Calculate Top-K
+        _, topk_indices = sim_chunk.topk(max_k, dim=-1, largest=True, sorted=True)
+        true_indices = torch.arange(i, end, device=device).view(-1, 1)
+        
+        for k in topk:
+            correct = topk_indices[:, :k].eq(true_indices).sum().item()
+            correct_counts[k] += correct
+            
+        # 2. Calculate Similarity Gap (Positives vs Negatives)
+        pos_sim_chunk = sim_chunk[torch.arange(end - i), torch.arange(i, end)]
+        total_pos_sim += pos_sim_chunk.sum().item()
+        
+        total_neg_sim += (sim_chunk.sum().item() - pos_sim_chunk.sum().item())
+        
+    accuracies = {f"Top-{k}": (correct_counts[k] / N) * 100.0 for k in topk}
+    pos_sim_avg = total_pos_sim / N
+    neg_sim_avg = total_neg_sim / (N * (N - 1)) if N > 1 else 0.0
+    
+    return accuracies, pos_sim_avg, neg_sim_avg
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--protocol", type=str, default="xsub", choices=["xsub", "xview"], 
+                        help="Choose 'xsub' (Cross-Subject) or 'xview' (Cross-View)")
+    args = parser.parse_args()
+
     print("="*65)
-    print(" PGMT Phase 1: Cross-Subject (X-Sub) Retrieval Evaluation")
+    print(f" PGMT Phase 1: {args.protocol.upper()} Instance Retrieval Evaluation")
     print("="*65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -51,7 +87,6 @@ def main():
         print(f"[!] Cannot find '{checkpoint_dir}/' folder. Wait for the training epoch to finish!")
         return
         
-    # Dynamically find and sort all epoch checkpoints
     checkpoints = sorted(
         glob.glob(os.path.join(checkpoint_dir, "pgmt_stage1_epoch_*.pth")), 
         key=lambda x: int(os.path.basename(x).split('epoch_')[1].split('.')[0])
@@ -61,22 +96,20 @@ def main():
         print(f"[!] No .pth files found in {checkpoint_dir}/")
         return
         
-    checkpoint_file = checkpoints[-1] # Automatically grab the latest epoch
+    checkpoint_file = checkpoints[-1] 
     print(f"[*] Found {len(checkpoints)} checkpoints. Using the latest: {checkpoint_file}")
 
-    # 1. Initialize X-Sub Evaluation Dataset
-    print("[*] Loading NTU X-Sub Test Dataset (Unseen Subjects Only)...")
+    # 1. Initialize Dataset using the Argparse Protocol
+    print(f"[*] Loading NTU {args.protocol.upper()} Test Dataset...")
     dataset = NTURGBD_EvalDataset(
         data_root="/pnr/lab/nurul/datasets/ntu_rgbd",
-        protocol="xsub", 
+        protocol=args.protocol, 
         split="test"
     )
-    
-    # Using batch size 32 for safe single-GPU extraction
     dataloader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=4)
 
-    # 2. Initialize Model
-    print(f"[*] Loading Architecture Weights...")
+    # 2. Load Models
+    print(f"[*] Loading Dual-Loss Architecture Weights...")
     model = PGMTDualStream(vis_dim=1024, stage1_pretraining=True).to(device)
     model = load_model_weights(model, checkpoint_file)
     model.eval()
@@ -84,7 +117,7 @@ def main():
     all_visual_features = []
     all_graph_features = []
     
-    print(f"[*] Extracting Features for X-Sub Retrieval Pool...")
+    print(f"[*] Extracting Geometric Spatial Features for Instance Retrieval...")
     
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
@@ -98,43 +131,37 @@ def main():
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 outputs = model(batch_gpu)
                 
-            vis_feat = outputs["info_nce_visual"]
-            graph_feat = outputs["info_nce_graph"]
+            # EXPLICITLY EVALUATE THE GEOMETRIC SPACE
+            # Instance matching requires the 3D depth and room structure of DINOv2
+            vis_feat = outputs["info_nce_visual_geo"]
+            graph_feat = outputs["info_nce_graph_geo"]
             
-            # L2 Normalize the features for Cosine Similarity (Added NaN Guard!)
             vis_feat = F.normalize(vis_feat.float(), dim=-1, eps=1e-8)
             graph_feat = F.normalize(graph_feat.float(), dim=-1, eps=1e-8)
             
             all_visual_features.append(vis_feat)
             all_graph_features.append(graph_feat)
             
-            if (i + 1) % 10 == 0:
+            if (i + 1) % 50 == 0:
                 print(f"    - Processed batch {i+1}/{len(dataloader)}")
 
-    # Concatenate all features to form the retrieval pool
+    # Concatenate all features
     visual_pool = torch.cat(all_visual_features, dim=0) # Shape: (N, 1024)
     graph_pool = torch.cat(all_graph_features, dim=0)   # Shape: (N, 1024)
     N = visual_pool.shape[0]
 
-    print(f"\n[*] Generated X-Sub Retrieval Pool of {N} multimodal pairs.")
-    print("[*] Computing Cross-Modal Cosine Similarity Matrix (This may take a moment)...")
+    print(f"\n[*] Generated {args.protocol.upper()} Retrieval Pool of {N} multimodal pairs.")
+    print("[*] Computing Chunked Cross-Modal Similarity Matrix (Memory Safe)...")
     
-    # Calculate N x N similarity matrix
-    sim_matrix = torch.matmul(graph_pool, visual_pool.T)
-
-    # Calculate Accuracies
-    g2v_acc = calculate_topk_accuracy(sim_matrix, topk=(1, 5, 10))
-    v2g_acc = calculate_topk_accuracy(sim_matrix.T, topk=(1, 5, 10))
-
-    # Calculate Similarity Gap (Proof of Contrastive Learning Success)
-    mask_pos = torch.eye(N, dtype=torch.bool, device=device)
-    pos_sim = sim_matrix[mask_pos].mean().item()
-    neg_sim = sim_matrix[~mask_pos].mean().item()
+    # Run Chunked Memory-Safe Evaluation
+    g2v_acc, pos_sim, neg_sim = compute_chunked_retrieval(query_pool=graph_pool, target_pool=visual_pool)
+    v2g_acc, _, _ = compute_chunked_retrieval(query_pool=visual_pool, target_pool=graph_pool)
 
     print("\n" + "="*65)
-    print(" OFFICIAL X-SUB EVALUATION RESULTS: CROSS-MODAL ALIGNMENT")
+    print(f" OFFICIAL {args.protocol.upper()} EVALUATION RESULTS: 1%, 5%, 10% TABLE")
     print("="*65)
-    print(f"Test Set: NTU-RGB+D Cross-Subject (Unseen Actors)")
+    print(f"Test Protocol: {args.protocol.upper()} (Exact Video Instance Matching)")
+    print(f"Latent Space:  Geometric (Fused SigLIP + DINOv2)")
     print(f"Total Retrieval Pool Size: {N} instances\n")
     
     print("Graph-to-Vision Retrieval (Given Skeleton -> Find Pixels):")

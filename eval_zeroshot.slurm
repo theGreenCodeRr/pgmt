@@ -1,15 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=PGMT_ZeroShot
-#SBATCH --exclude=antelope                   
-#SBATCH --gres=gpu:1                         
-#SBATCH --cpus-per-task=8             
-#SBATCH --mem=70G                                    
-#SBATCH --output=logs/pgmt_zeroshot_%j.log   
+#SBATCH --partition=d
+#SBATCH --exclude=antelope,wildebeest
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8     
+#SBATCH --mem=70G         
+#SBATCH --output=logs/pgmt_ZeroShot_%j.log  
 
-# Silence PyTorch warnings
-export OMP_NUM_THREADS=1
-
-# Force local caches to bypass /home/ permission drops!
+export OMP_NUM_THREADS=1   # Silence PyTorch warnings
 export HF_HOME="/pnr/lab/nurul/PGMT_Code/hf_cache"
 export TORCH_HOME="/pnr/lab/nurul/PGMT_Code/torch_cache"
 

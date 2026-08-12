@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=PGMT_GTA_FA
-#SBATCH --partition=d
 #SBATCH --nodelist=oniwaka
 #SBATCH --requeue
 #SBATCH --gres=gpu:2                
