@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=PGMT_retrieval
-#SBATCH --partition=d
-#SBATCH --exclude=antelope,wildebeest
+#SBATCH --nodes=1
+#SBATCH --nodelist=imawaka,bateira
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8     
-#SBATCH --mem=70G                                               
+#SBATCH --mem=50G                                                
 #SBATCH --output=logs/pgmt_retrieval_%j.log  
 
 export OMP_NUM_THREADS=1     # Silence PyTorch warnings
