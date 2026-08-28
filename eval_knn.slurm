@@ -4,7 +4,7 @@
 #SBATCH --nodelist=imawaka,bateira
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8     
-#SBATCH --mem=50G         
+#SBATCH --mem=70G         
 #SBATCH --output=logs/pgmt_knn_%j.log  
 
 export OMP_NUM_THREADS=1   # Silence PyTorch warnings
