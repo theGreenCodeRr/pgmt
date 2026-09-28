@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=PGMT_GTA_FA
-#SBATCH --nodelist=oniwaka
+#SBATCH --nodes=1
+#SBATCH --nodelist=imawaka,oniwaka
 #SBATCH --requeue
 #SBATCH --gres=gpu:2                
 #SBATCH --cpus-per-task=8            

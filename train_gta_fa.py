@@ -187,7 +187,7 @@ def train_epoch(model, dataloader, optimizer, accumulation_steps, local_rank):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=160)
     parser.add_argument("--batch_size", type=int, default=64) 
     parser.add_argument("--accumulation_steps", type=int, default=4) 
     parser.add_argument("--lr", type=float, default=3e-4)
