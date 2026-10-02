@@ -18,7 +18,7 @@ class DualVisionEncoder(nn.Module):
     """
     Fuses semantic features (SigLIP) with geometric/depth features (DINOv2).
     Maps both to a unified 24x24 spatial grid (576 tokens).
-    Now returns BOTH the Fused Geometry tokens and Pure Semantic tokens.
+    Returns BOTH the Fused Geometry tokens and Pure Semantic tokens.
     """
     def __init__(self, output_dim=1024):
         super().__init__()
@@ -31,11 +31,13 @@ class DualVisionEncoder(nn.Module):
         self.dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
         
         # Freeze both backbone weights to conserve VRAM
-        for param in self.siglip.parameters(): param.requires_grad = False
-        for param in self.dinov2.parameters(): param.requires_grad = False
+        for param in self.siglip.parameters(): 
+            param.requires_grad = False
+        for param in self.dinov2.parameters(): 
+            param.requires_grad = False
             
-        siglip_dim = self.siglip.config.hidden_size # 1024
-        dinov2_dim = self.dinov2.embed_dim          # 1024
+        siglip_dim = self.siglip.config.hidden_size  # 1024
+        dinov2_dim = self.dinov2.embed_dim           # 1024
         
         # MLP Fusion Projector (1024 + 1024 -> 2048 -> 1024)
         self.fusion_projector = nn.Sequential(
@@ -53,12 +55,10 @@ class DualVisionEncoder(nn.Module):
         rgb_dinov2 = rgb_dinov2.view(B * T, C, H_d, W_d)
         
         with torch.no_grad():
-            # Pure Semantic Space (Perfectly aligned with text natively)
-            # Take the global pooled token instead of the full grid
-            # SigLIP returns pooler_output which is the global summary
-            # We also need the patch grid for pathway A, so we keep both
-            siglip_out_grid = self.siglip(rgb_siglip).last_hidden_state # (B*T, 576, 1024)
-            siglip_out_global = self.siglip(rgb_siglip).pooler_output # (B*T, 1024)
+            # 1-PASS OPTIMIZATION: Extract grid and pooler outputs simultaneously
+            siglip_output = self.siglip(rgb_siglip)
+            siglip_out_grid = siglip_output.last_hidden_state   # (B*T, 576, 1024)
+            siglip_out_global = siglip_output.pooler_output     # (B*T, 1024)
             
             # Pure Geometric Space (Understands depth and bounding box structures)
             dinov2_out_grid = self.dinov2.forward_features(rgb_dinov2)['x_norm_patchtokens']
@@ -75,7 +75,7 @@ class DualVisionEncoder(nn.Module):
 # =====================================================================
 class MS_HyperTR(nn.Module):
     """
-    Processes Joints, Bones, and Motion streams simultaneously using FlashAttention.
+    Processes Joints, Bones, and Motion streams simultaneously using Multi-Head Attention.
     """
     def __init__(self, num_nodes=25, in_dim=3, hidden_dim=256, num_layers=4, num_heads=8):
         super().__init__()
@@ -94,7 +94,12 @@ class MS_HyperTR(nn.Module):
             batch_first=True,
             norm_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # enable_nested_tensor=False cleanly suppresses the PyTorch norm_first warning
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers, 
+            enable_nested_tensor=False
+        )
 
     def forward(self, physics_streams):
         B, T, Streams, W, S, V, C = physics_streams.shape
@@ -120,7 +125,7 @@ class MS_HyperTR(nn.Module):
 
 
 # =====================================================================
-# MODULE 3: POOLING & CROSS-ATTENTION ADAPTORS (FA) 
+# MODULE 3: POOLING & CROSS-ATTENTION ADAPTORS
 # =====================================================================
 class TemporalQueryPooler(nn.Module):
     def __init__(self, input_dim=256, embed_dim=1024, num_queries=4):
@@ -155,7 +160,8 @@ class DirectCrossAttention(nn.Module):
 
 class PGMTDualStream(nn.Module):
     """
-    Master Wrapper for Phase 1: Dual Vision + MS-HyperTR + DUAL Contrastive Alignment
+    Master Wrapper for Phase 1: Dual Vision + MS-HyperTR + DUAL Contrastive Alignment.
+    Retains identical state_dict structure to preserve existing checkpoint compatibility.
     """
     def __init__(self, vis_dim=1024, stage1_pretraining=True, llm_dim=4096): 
         super().__init__()
@@ -177,7 +183,6 @@ class PGMTDualStream(nn.Module):
         
         # -----------------------------------------------------
         # DUAL-LOSS PATHWAY B: Semantic Anchor (Pure SigLIP Space)
-        # Note: We now match the global token, so we just project the queries
         # -----------------------------------------------------
         self.q_proj_sem = nn.Linear(vis_dim, vis_dim)
         self.norm_q_sem = nn.LayerNorm(vis_dim)
@@ -189,15 +194,15 @@ class PGMTDualStream(nn.Module):
     def forward(self, batch):
         B, T = batch["visual_frames_siglip"].shape[:2]
         
-        # 1. Vision Forward (Extracting both spaces)
+        # 1. Vision Forward (Extracting both spaces with 1-pass SigLIP)
         vis_tokens_fused, vis_tokens_siglip_global = self.vision_encoder(
             batch["visual_frames_siglip"], 
             batch["visual_frames_dinov2"]
         )
         
-        # 2. Kinematic Forward (3-Streams into 4 queries)
+        # 2. Kinematic Forward (3 streams into 4 queries)
         ms_features = self.kinematic_encoder(batch["kinematic_streams"]) 
-        Q_graph = self.temporal_pooler(ms_features) # (B, T, 4, vis_dim)
+        Q_graph = self.temporal_pooler(ms_features)  # (B, T, 4, vis_dim)
         
         # ==========================================================
         # PATHWAY A: Geometric Grounding
@@ -211,14 +216,15 @@ class PGMTDualStream(nn.Module):
         # ==========================================================
         # PATHWAY B: Semantic Text Anchor (Global)
         # ==========================================================
-        # We align directly to the GLOBAL pure SigLIP space
         v_flat_sem_global = vis_tokens_siglip_global.view(B * T, -1)
         q_flat_sem = self.norm_q_sem(self.q_proj_sem(Q_graph.view(B * T, 4, -1)))
 
         # ==========================================================
-        # Anchor Target Extraction
+        # Anchor Target Extraction with NaN/Inf Guardrail
         # ==========================================================
         flat_anchors = batch["spatial_anchors"][:, :, 0, :].contiguous().view(B * T, 2)
+        # Guardrail: Replaces uninitialized/NaN Kinect coordinates with center anchor (0.5, 0.5)
+        flat_anchors = torch.nan_to_num(flat_anchors, nan=0.5, posinf=0.5, neginf=0.5)
         patch_x = (flat_anchors[:, 0] * 24).clamp(0, 23).long()
         patch_y = (flat_anchors[:, 1] * 24).clamp(0, 23).long()
         patch_idx = ((patch_y * 24) + patch_x).clamp(0, 575)
@@ -229,7 +235,6 @@ class PGMTDualStream(nn.Module):
         contrastive_graph_geo = q_flat_geo.mean(dim=1) 
         
         # Semantic InfoNCE pairs (Global Semantic matching)
-        # FIX: We now compare the average graph token directly to the Global Image Token
         target_visual_key_sem = v_flat_sem_global 
         contrastive_graph_sem = q_flat_sem.mean(dim=1)
         
@@ -245,11 +250,7 @@ class PGMTDualStream(nn.Module):
         
         llm_aligned_tokens = None
         if not self.stage1_pretraining:
-            # In Phase 2, we merge the highly intelligent tokens before passing to the LLM
             grounded_tokens_geo = self.cross_attn_geo(query=q_flat_geo, key=k_flat_geo, value=v_flat_norm_geo)
-            
-            # Since Sem is now global, we don't cross-attend to a grid, we just expand it or add it
-            # A simple addition of the global semantic vector to the spatially grounded vector
             final_fused_tokens = grounded_tokens_geo + q_flat_sem
             llm_aligned_tokens = self.llm_proj(final_fused_tokens).view(B, T * 4, -1)
         
@@ -265,6 +266,7 @@ class PGMTDualStream(nn.Module):
             "logit_scale_sem": safe_logit_scale_sem
         }
 
+
 # =====================================================================
 # QUICK TEST BLOCK
 # =====================================================================
@@ -272,11 +274,9 @@ if __name__ == "__main__":
     print("[*] Testing PGMT Dual-Stream Architecture Forward Pass...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Initialize the model
     model = PGMTDualStream(vis_dim=1024, stage1_pretraining=True).to(device)
     model.eval()
     
-    # Generate a dummy batch mimicking dataset_ntu outputs
     dummy_batch = {
         "visual_frames_siglip": torch.randn(2, 3, 3, 384, 384).to(device),
         "visual_frames_dinov2": torch.randn(2, 3, 3, 336, 336).to(device),
@@ -295,4 +295,4 @@ if __name__ == "__main__":
         else:
             print(f"  - {key}: None (Expected in Phase 1)")
             
-    print("\n[*] Dual-Loss Architecture is fully functional and ready for Phase 1 Training!")
+    print("\n[*] Dual-Loss Architecture pass verified successfully.")

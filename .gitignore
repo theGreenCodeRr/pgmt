@@ -8,3 +8,6 @@ hf_cache/
 torch_cache/
 matplotlib_cache/
 outputs/
+offline_features/
+torchelastic_ilsu54gm/
+checkpoints_retrain/
