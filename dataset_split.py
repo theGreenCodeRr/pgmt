@@ -13,11 +13,18 @@ class NTURGBD_SplitDataset(Dataset):
     Loads pre-extracted visual chunks (geo_fused, sem_global) from RAM and parses 
     raw skeletons on the fly. Applies strict NTU-120 X-Sub, X-Set, and Zero-Shot splits.
     """
-    def __init__(self, chunk_data, skeleton_dir="/pnr/lab/nurul/datasets/ntu_rgbd/skeleton", 
+    def __init__(self, chunk_data, skeleton_dir=None, 
                  protocol="xsub", split="train", zsl_classes=0, 
                  num_visual_frames=3, window_size=30, max_subjects=2):
         super().__init__()
-        self.skeleton_dir = os.path.normpath(skeleton_dir)
+        
+        # Dynamically route to the local NVMe drive staged by SLURM
+        if skeleton_dir is None:
+            slurm_tmp = os.environ.get("SLURM_TMPDIR", "/tmp")
+            self.skeleton_dir = os.path.join(slurm_tmp, "skeleton")
+        else:
+            self.skeleton_dir = os.path.normpath(skeleton_dir)
+
         self.chunk_data = chunk_data
         
         self.protocol = protocol.lower()

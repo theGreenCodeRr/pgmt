@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=PGMT_tSNE
 #SBATCH --nodes=1
-#SBATCH --nodelist=imawaka,bateira
+#SBATCH --nodelist=bateira,otowaka,xenon
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8     
-#SBATCH --mem=70G     
+#SBATCH --mem=50G     
 #SBATCH --output=logs/pgmt_tsne_%j.log  
 
 export OMP_NUM_THREADS=1   # Silence PyTorch warnings
@@ -18,5 +18,7 @@ echo "=========================================================="
 source /shared/miniconda3/etc/profile.d/conda.sh
 conda activate /pnr/lab/nurul/PGMT_Code/env
 
-python eval_tsne.py
+echo "[*] Generating t-SNE across Orthogonal Target Classes..."
+python eval_tsne.py --protocol all --split all
+
 echo "Evaluation Complete."

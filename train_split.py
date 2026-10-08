@@ -1,4 +1,5 @@
 import os
+import sys
 import gc
 import glob
 import argparse
@@ -12,8 +13,18 @@ from tqdm import tqdm
 from dataset_split import NTURGBD_SplitDataset
 from pgmt_split_architecture import PGMTSplitStream
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger(__name__)
+
+def get_trainable_state_dict(model):
+    """Safely extracts requires_grad=True weights bypassing detached state_dict flags."""
+    trainable_names = [k for k, v in model.named_parameters() if v.requires_grad]
+    full_state_dict = model.state_dict()
+    return {k: full_state_dict[k] for k in trainable_names}
 
 def infonce_loss(visual_features, graph_features, logit_scale):
     logits = logit_scale * visual_features @ graph_features.T
@@ -22,9 +33,11 @@ def infonce_loss(visual_features, graph_features, logit_scale):
 
 def train_chunk(model, dataloader, optimizer, device):
     model.train()
-    total_loss = 0.0
+    total_geo = 0.0
+    total_sem = 0.0
     
-    pbar = tqdm(dataloader, desc="  Batch Progress", leave=False, ascii=True)
+    # HPC-Safe tqdm: Prevents SLURM log file spam by updating only every 30 seconds
+    pbar = tqdm(dataloader, desc="  Batch Progress", leave=False, ascii=True, mininterval=30.0, file=sys.stdout)
     
     for batch in pbar:
         B, T = batch["geo_fused"].shape[:2]
@@ -49,10 +62,13 @@ def train_chunk(model, dataloader, optimizer, device):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
-        total_loss += loss.item()
-        pbar.set_postfix(Loss=f"{loss.item():.4f}", refresh=False)
+        total_geo += loss_geo.item()
+        total_sem += loss_sem.item()
         
-    return total_loss / len(dataloader)
+        # Explicitly display separated dual losses for graphing
+        pbar.set_postfix(GeoLoss=f"{loss_geo.item():.4f}", SemLoss=f"{loss_sem.item():.4f}", refresh=False)
+        
+    return total_geo / len(dataloader), total_sem / len(dataloader)
 
 def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -61,7 +77,7 @@ def main():
     parser.add_argument("--protocol", type=str, default="xsub", choices=["xsub", "xset"])
     parser.add_argument("--zsl_classes", type=int, default=0, choices=[0, 10, 24])
     parser.add_argument("--epochs", type=int, default=150)
-    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     args = parser.parse_args()
     
@@ -75,11 +91,18 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
     
-    chunk_files = sorted(glob.glob("/pnr/lab/nurul/PGMT_Code/offline_features/ntu_features_chunk_*.pt"))
+    # Read instantly from the hardcoded surviving NVMe path
+    slurm_tmp = os.environ.get("SLURM_TMPDIR", "/tmp")
+    chunk_files = sorted(glob.glob(os.path.join(slurm_tmp, "ntu_features_chunk_*.pt")))
+    
+    if not chunk_files:
+        logger.error(f"[!] No feature chunks found in {slurm_tmp}. The hijack failed.")
+        sys.exit(1)
     
     for epoch in range(args.epochs):
         logger.info(f"--- Epoch {epoch+1}/{args.epochs} ---")
-        epoch_loss = 0.0
+        epoch_geo = 0.0
+        epoch_sem = 0.0
         active_chunks = 0
         
         for chunk_file in chunk_files:
@@ -87,6 +110,7 @@ def main():
             
             dataset = NTURGBD_SplitDataset(
                 chunk_data=chunk_data, 
+                skeleton_dir=None, 
                 protocol=args.protocol, 
                 split="train", 
                 zsl_classes=args.zsl_classes
@@ -97,23 +121,29 @@ def main():
                 gc.collect()
                 continue
                 
-            # num_workers=0 prevents any multi-process memory duplication
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
+            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
             
-            chunk_loss = train_chunk(model, dataloader, optimizer, device)
-            epoch_loss += chunk_loss
+            chunk_geo, chunk_sem = train_chunk(model, dataloader, optimizer, device)
+            epoch_geo += chunk_geo
+            epoch_sem += chunk_sem
             active_chunks += 1
             
             del chunk_data, dataset, dataloader
             gc.collect()
             
         scheduler.step()
-        avg_epoch_loss = epoch_loss / max(1, active_chunks)
-        logger.info(f"Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
+        avg_geo = epoch_geo / max(1, active_chunks)
+        avg_sem = epoch_sem / max(1, active_chunks)
+        total_avg = avg_geo + avg_sem
         
-        if (epoch + 1) % 10 == 0 or (epoch + 1) == args.epochs:
-            save_path = os.path.join(checkpoint_dir, f"epoch_{epoch+1}.pth")
-            torch.save(model.state_dict(), save_path)
+        # Log all three metrics required for your graphing
+        logger.info(f"Epoch {epoch+1} Complete | GeoLoss: {avg_geo:.4f} | SemLoss: {avg_sem:.4f} | Total: {total_avg:.4f}")
+        
+        # Save fixed ~60MB checkpoints
+        trainable_weights = get_trainable_state_dict(model)
+        save_path = os.path.join(checkpoint_dir, f"epoch_{epoch+1}.pth")
+        torch.save(trainable_weights, save_path)
+        logger.info(f"[*] Saved optimized Phase 1 weights to {save_path}")
 
 if __name__ == "__main__":
     main()

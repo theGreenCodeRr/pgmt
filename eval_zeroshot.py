@@ -1,4 +1,5 @@
 import os
+import argparse
 # CACHE FIX: Force Hugging Face and PyTorch Hub to use local folders
 os.environ["HF_HOME"] = "/pnr/lab/nurul/PGMT_Code/hf_cache"
 os.environ["TORCH_HOME"] = "/pnr/lab/nurul/PGMT_Code/torch_cache"
@@ -71,36 +72,59 @@ def get_text_embeddings(device):
     return text_features
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, default="/pnr/lab/nurul/datasets/ntu_rgbd")
+    parser.add_argument("--protocol", type=str, default="all", choices=["all", "xsub", "xset", "xview"],
+                        help="Partition protocol. Use 'all' for full uncurated dataset.")
+    parser.add_argument("--split", type=str, default="all", choices=["all", "train", "test"],
+                        help="Data split. Use 'all' for full uncurated dataset.")
+    parser.add_argument("--checkpoint", type=str, default=None, 
+                        help="Explicit path to checkpoint file (e.g., checkpoints/pgmt_stage1_epoch_160.pth)")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--no_pool_temporal", action="store_true",
+                        help="Disable mean-pooling across temporal frames.")
+    args = parser.parse_args()
+
+    pool_temporal = not args.no_pool_temporal
+
     print("="*65)
-    print(" PGMT Phase 1: Zero-Shot Text-to-Skeleton Retrieval (NTU-120)")
+    print(" PGMT Phase 1: 120-Class Zero-Shot Text Retrieval")
+    print(f" Protocol: {args.protocol.upper()} | Split: {args.split.upper()} | Temporal Pooling: {pool_temporal}")
     print("="*65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # --- AUTO-CHECKPOINT FINDER ---
-    checkpoint_dir = "checkpoints"
-    checkpoints = sorted(
-        glob.glob(os.path.join(checkpoint_dir, "pgmt_stage1_epoch_*.pth")), 
-        key=lambda x: int(os.path.basename(x).split('epoch_')[1].split('.')[0])
-    )
-    
-    if not checkpoints:
-        print(f"[!] No .pth files found in {checkpoint_dir}/")
-        return
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        checkpoint_file = args.checkpoint
+    else:
+        checkpoint_dir = "checkpoints"
+        if not os.path.exists(checkpoint_dir):
+            print(f"[!] Cannot find '{checkpoint_dir}/' folder.")
+            return
+            
+        checkpoints = sorted(
+            glob.glob(os.path.join(checkpoint_dir, "pgmt_stage1_epoch_*.pth")), 
+            key=lambda x: int(os.path.basename(x).split('epoch_')[1].split('.')[0])
+        )
+        if not checkpoints:
+            print(f"[!] No .pth files found in {checkpoint_dir}/")
+            return
+        checkpoint_file = checkpoints[-1] 
         
-    checkpoint_file = checkpoints[-1] 
-    print(f"[*] Found {len(checkpoints)} checkpoints. Using: {checkpoint_file}")
+    print(f"[*] Target Checkpoint: {checkpoint_file}")
 
     # 1. Initialize Dataset
-    print("[*] Loading NTU-120 X-Sub Test Dataset (Unseen Subjects Only)...")
+    print(f"[*] Loading Dataset ({args.protocol.upper()} - {args.split.upper()})...")
     dataset = NTURGBD_EvalDataset(
-        data_root="/pnr/lab/nurul/datasets/ntu_rgbd",
-        protocol="xsub", 
-        split="test"
+        data_root=args.data_root,
+        protocol=args.protocol, 
+        split=args.split
     )
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # 2. Load Models
+    print(f"[*] Loading Dual-Loss Architecture...")
     model = PGMTDualStream(vis_dim=1024, stage1_pretraining=True).to(device)
     model = load_model_weights(model, checkpoint_file)
     model.eval()
@@ -131,8 +155,14 @@ def main():
             # This space is perfectly anchored to the pure SigLIP text representation
             graph_feat = outputs["info_nce_graph_sem"]
             
-            # Pool across the Time dimension to get 1 embedding per video
-            graph_feat = graph_feat.view(B, T, -1).mean(dim=1) # Shape: (B, 1024)
+            if pool_temporal:
+                # Pool across the Time dimension to get 1 embedding per video
+                graph_feat = graph_feat.view(B, T, -1).mean(dim=1) # Shape: (B, 1024)
+            else:
+                # Per-frame mapping (increases sequence evaluation count)
+                graph_feat = graph_feat.view(B * T, -1)
+                labels = labels.repeat_interleave(T)
+                
             graph_feat = F.normalize(graph_feat.float(), dim=-1, eps=1e-8)
             
             # Compute Cosine Similarity against all 120 Text Prompts
@@ -142,7 +172,7 @@ def main():
             # Top-K Calculation
             _, top5_indices = logits.topk(5, dim=-1, largest=True, sorted=True)
             
-            for j in range(B):
+            for j in range(logits.shape[0]):
                 true_label = labels[j].item()
                 if true_label >= 120: 
                     continue # Safety check
@@ -153,8 +183,8 @@ def main():
                 if true_label in top5_indices[j].tolist():
                     top5_correct += 1
 
-            if (i + 1) % 10 == 0:
-                print(f"    - Processed batch {i+1}/{len(dataloader)}")
+            if (i + 1) % 100 == 0 or (i + 1) == len(dataloader):
+                print(f"    - Processed batch {i + 1}/{len(dataloader)}")
 
     # Final Metrics
     if total_samples > 0:
@@ -166,14 +196,11 @@ def main():
     print("\n" + "="*65)
     print(" ZERO-SHOT TEXT-TO-SKELETON RETRIEVAL RESULTS (NTU-120)")
     print("="*65)
-    print(f"Test Set: NTU-RGB+D 120 Cross-Subject")
+    print(f"Dataset Pool: Protocol {args.protocol.upper()} | Split {args.split.upper()}")
     print(f"Latent Space: Pure Semantic Dual-Loss Anchor")
     print(f"Total Evaluated Sequences: {total_samples}")
     print(f"\n  Top-1 Zero-Shot Accuracy: {top1_acc:.2f}%")
     print(f"  Top-5 Zero-Shot Accuracy: {top5_acc:.2f}%")
-    print("\nNote: By utilizing the Dual-Loss Architecture, this score now")
-    print("represents true zero-shot structural generalization without")
-    print("the interference of DINOv2 depth geometry.")
     print("="*65)
 
 if __name__ == "__main__":

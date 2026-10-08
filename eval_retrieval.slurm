@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=PGMT_retrieval
 #SBATCH --nodes=1
-#SBATCH --nodelist=imawaka,bateira
+#SBATCH --nodelist=bateira,otowaka,xenon
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8     
 #SBATCH --mem=50G                                                
@@ -18,10 +18,7 @@ echo "=========================================================="
 source /shared/miniconda3/etc/profile.d/conda.sh
 conda activate /pnr/lab/nurul/PGMT_Code/env
 
-echo "[*] Starting X-Sub Evaluation..."
-python eval_retrieval.py --protocol xsub
-
-echo "[*] Starting X-View Evaluation..."
-python eval_retrieval.py --protocol xview
+echo "[*] Starting Full Uncurated Domain Evaluation (114k)..."
+python eval_retrieval.py --protocol all --split all
 
 echo "Evaluation Complete."

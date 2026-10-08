@@ -11,12 +11,13 @@ logger = logging.getLogger(__name__)
 
 class NTURGBD_EvalDataset(Dataset):
     """
-    PGMT Phase 1 Evaluation Dataset.
-    Includes official NTU RGB+D splitting protocols (X-Sub, X-View) 
+    PGMT Phase 1 Evaluation Dataset (NTU-120 Fixed).
+    Includes official NTU RGB+D 120 splitting protocols (X-Sub, X-Set) 
     and extracts ground-truth Action Labels for t-SNE and Zero-Shot testing.
+    Supports 'all' to load the full uncurated dataset for Foundation scale evaluations.
     """
     def __init__(self, data_root="/pnr/lab/nurul/datasets/ntu_rgbd", 
-                 protocol="xsub", split="test", 
+                 protocol="all", split="all", 
                  num_visual_frames=3, window_size=30, max_subjects=2):
         super().__init__()
         self.data_root = os.path.normpath(data_root)
@@ -27,12 +28,17 @@ class NTURGBD_EvalDataset(Dataset):
         self.window_size = window_size
         self.max_subjects = max_subjects
         self.num_joints = 25
-        self.protocol = protocol.lower() # 'xsub', 'xview', or 'all'
+        self.protocol = protocol.lower() # 'xsub', 'xset', 'xview' (legacy NTU-60), or 'all'
         self.split = split.lower()       # 'train', 'test', or 'all'
         
-        # NTU-60 Official Cross-Subject (X-Sub) Training IDs
-        self.ntu60_train_subjects = [1, 2, 4, 5, 8, 9, 13, 14, 15, 16, 17, 18, 19, 25, 27, 28, 31, 34, 35, 38]
-        # NTU-60 Official Cross-View (X-View) Training Camera IDs
+        # OFFICIAL NTU-120 Cross-Subject (X-Sub) Training IDs (53 Subjects)
+        self.ntu120_train_subjects = [
+            1, 2, 4, 5, 8, 9, 13, 14, 15, 16, 17, 18, 19, 25, 27, 28, 31, 34, 35, 38, 
+            45, 46, 47, 49, 50, 52, 53, 54, 55, 56, 57, 58, 59, 70, 74, 78, 80, 81, 82, 
+            83, 84, 85, 86, 89, 91, 92, 93, 94, 95, 97, 98, 100, 103
+        ]
+        
+        # Legacy NTU-60 Cross-View (X-View) Training Camera IDs
         self.ntu60_train_cameras = [2, 3] 
 
         self.bone_pairs = [
@@ -63,15 +69,17 @@ class NTURGBD_EvalDataset(Dataset):
             return True
             
         if self.protocol == 'xsub':
-            is_train = meta_info['subject'] in self.ntu60_train_subjects
+            is_train = meta_info['subject'] in self.ntu120_train_subjects
             return is_train if self.split == 'train' else not is_train
             
-        elif self.protocol == 'xview':
+        elif self.protocol == 'xset': 
+            # NTU-120 Protocol: Even setups are train, odd setups are test
+            is_train = (meta_info['setup'] % 2 == 0) 
+            return is_train if self.split == 'train' else not is_train
+            
+        elif self.protocol == 'xview': 
+            # Legacy NTU-60 Protocol
             is_train = meta_info['camera'] in self.ntu60_train_cameras
-            return is_train if self.split == 'train' else not is_train
-            
-        elif self.protocol == 'xset': # NTU-120 Protocol
-            is_train = (meta_info['setup'] % 2 == 0) # Even setups are train
             return is_train if self.split == 'train' else not is_train
             
         return False
@@ -96,7 +104,7 @@ class NTURGBD_EvalDataset(Dataset):
                     'sample_id': base_name,
                     'skeleton_path': skel_path,
                     'rgb_path': rgb_path,
-                    'action_label': meta_info['action'] - 1 # 0-indexed for PyTorch
+                    'action_label': meta_info['action'] - 1 # 0-indexed for PyTorch (0 to 119)
                 })
                 
         return valid_samples
@@ -223,7 +231,7 @@ class NTURGBD_EvalDataset(Dataset):
             
         return {
             "sample_id": sample_info['sample_id'],
-            "action_label": sample_info['action_label'], # NEW: Required for t-SNE and Zero-Shot!
+            "action_label": sample_info['action_label'], 
             "visual_frames_siglip": rgb_siglip,
             "visual_frames_dinov2": rgb_dinov2,
             "kinematic_streams": torch.stack(physics_streams),
