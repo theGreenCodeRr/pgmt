@@ -1,64 +1,88 @@
 #!/bin/bash
-#SBATCH --job-name=PGMT_SplitTrain
+#SBATCH --job-name=Split_ZSL0_xset
 #SBATCH --partition=d
-#SBATCH --nodelist=oniwaka
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=65G
-#SBATCH --output=logs/pgmt_split_training_%j.log
+#SBATCH --nodes=1
+#SBATCH --nodelist=imawaka,oniwaka
+#SBATCH --gres=gpu:2              
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=70G                # or 70G for oniwaka
+#SBATCH --output=logs/split_zsl0_%j.log
 
-# Abort immediately if any command fails
 set -e
 
-# Explicitly define and create the local NVMe scratch folder
-#export SLURM_TMPDIR="/tmp/$SLURM_JOB_ID"
-#mkdir -p $SLURM_TMPDIR
+# ======================================================================
+# --- [ZONE 2] TRAINING HYPERPARAMETERS 
+# ======================================================================
+# RUN 1: Standard Inductive X-Sub (All 120 Classes)
+#PROTOCOL="xsub"
+#ZSL_CLASSES=0
 
-export SLURM_TMPDIR="/tmp/13357"
+# RUN 2: Standard Inductive X-Set (All 120 Classes)
+PROTOCOL="xset"
+ZSL_CLASSES=0
 
-# STRICT SAFETY GUARDRAIL: Wipe local NVMe storage instantly on exit, interrupt, or terminate
-#trap 'echo "[*] Job terminated. Wiping local NVMe storage..."; rm -rf $SLURM_TMPDIR; echo "[*] Cleanup complete."' EXIT INT TERM
+# RUN 3: Zero-Shot X-Sub (110 Seen / 10 Unseen)
+# PROTOCOL="xsub"
+# ZSL_CLASSES=10
+
+# RUN 4: Zero-Shot X-Sub (96 Seen / 24 Unseen)
+# PROTOCOL="xsub"
+# ZSL_CLASSES=24
+
+BATCH_SIZE=256            
+EPOCHS=250
+
+# ======================================================================
+# --- [ZONE 3] NETWORK & STORAGE PATHS ---
+# ======================================================================
+# Old NAS path for staging data (Read-Only)
+BASE_ENV_DIR="/pnr/lab/nurul/PGMT_Code"
+NAS_SKELETON_DIR="/pnr/lab/nurul/datasets/ntu_rgbd/skeleton/"
+NAS_FEATURE_DIR="/pnr/lab/nurul/PGMT_Code/offline_features/"
+
+# NAS path for saving checkpoints (Write-Only)
+NAS_SAVE_DIR="/pnr/lab/nurul/PGMT_Code/checkpoints_retrain"
+
+# ======================================================================
+# EXECUTION LOGIC (Do not modify below this line)
+# ======================================================================
+LOCAL_SKEL_DIR="/tmp/skeleton_cache"
+LOCAL_PT_DIR="/tmp/feature_cache"
 
 export OMP_NUM_THREADS=1
-export HF_HOME="/pnr/lab/nurul/PGMT_Code/hf_cache"
-export TORCH_HOME="/pnr/lab/nurul/PGMT_Code/torch_cache"
-
-#echo "=========================================================="
-#echo "Starting Tier 3 Multi-Split Retraining Pipeline"
-#echo "Target Node: $SLURMD_NODENAME"
-#echo "=========================================================="
-
-# 1. Stage the Visual Features
-#echo "[*] Copying 12 feature chunks from NAS to Local NVMe ($SLURM_TMPDIR)..."
-#cp /pnr/lab/nurul/PGMT_Code/offline_features/ntu_features_chunk_*.pt $SLURM_TMPDIR/
-
-# 2. Stage the Kinematics via Single Archive
-#echo "[*] Copying single skeleton archive to local NVMe..."
-#cp /pnr/lab/nurul/datasets/ntu_rgbd/ntu_skeletons.tar $SLURM_TMPDIR/
-
-#echo "[*] Extracting skeletons on local NVMe..."
-#tar -xf $SLURM_TMPDIR/ntu_skeletons.tar -C $SLURM_TMPDIR/
-#rm -f $SLURM_TMPDIR/ntu_skeletons.tar
-#echo "[*] Data staging complete. Fast local I/O initialized."
-
-echo "[*] Data hijack complete. Fast local I/O initialized."
-
-source /shared/miniconda3/etc/profile.d/conda.sh
-conda activate /pnr/lab/nurul/PGMT_Code/env
-
-# 3. Execute Fast Training 
-echo "[*] Launching Protocol: X-Sub | ZSL: 0"
-python train_split.py --protocol xsub --zsl_classes 0 --batch_size 256
-
-echo "[*] Launching Protocol: X-Set | ZSL: 0"
-python train_split.py --protocol xset --zsl_classes 0 --batch_size 256
-
-echo "[*] Launching Protocol: X-Sub | ZSL: 10"
-python train_split.py --protocol xsub --zsl_classes 10 --batch_size 256
-
-echo "[*] Launching Protocol: X-Sub | ZSL: 24"
-python train_split.py --protocol xsub --zsl_classes 24 --batch_size 256
+export HF_HOME="${BASE_ENV_DIR}/hf_cache"
+export TORCH_HOME="${BASE_ENV_DIR}/torch_cache"
+export PATH="/pnr/lab/nurul/PGMT_Code/env/bin:$PATH"   # if /shared conda broken, use this path instead
 
 echo "=========================================================="
-echo "All 4 Retraining Protocols Successfully Completed."
+echo "Starting DDP Split Training on Node: $SLURMD_NODENAME"
+echo "Protocol: $PROTOCOL | ZSL Classes: $ZSL_CLASSES | Local Batch: $BATCH_SIZE"
+echo "Target Checkpoint Directory: $NAS_SAVE_DIR"
+echo "=========================================================="
+
+echo "[*] Verifying persistent local NVMe caches on /tmp..."
+mkdir -p $LOCAL_SKEL_DIR
+mkdir -p $LOCAL_PT_DIR
+
+echo "[*] Staging Skeletons from: $NAS_SKELETON_DIR"
+rsync -a ${NAS_SKELETON_DIR} ${LOCAL_SKEL_DIR}/
+
+echo "[*] Staging Features from: $NAS_FEATURE_DIR"
+rsync -a ${NAS_FEATURE_DIR} ${LOCAL_PT_DIR}/
+
+echo "[*] Activating Conda Environment..."
+# source /shared/miniconda3/etc/profile.d/conda.sh
+# conda activate ${BASE_ENV_DIR}/env
+
+echo "[*] Launching Distributed PyTorch Training..."
+torchrun --standalone --nproc_per_node=2 train_split.py \
+    --protocol $PROTOCOL \
+    --zsl_classes $ZSL_CLASSES \
+    --epochs $EPOCHS \
+    --batch_size $BATCH_SIZE \
+    --lr 3e-4 \
+    --save_dir $NAS_SAVE_DIR
+
+echo "=========================================================="
+echo "Job Successfully Completed on Node: $SLURMD_NODENAME"
 echo "=========================================================="

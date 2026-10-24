@@ -18,12 +18,19 @@ class NTURGBD_SplitDataset(Dataset):
                  num_visual_frames=3, window_size=30, max_subjects=2):
         super().__init__()
         
-        # Dynamically route to the local NVMe drive staged by SLURM
+        # FIX 1: Point exactly to skeleton_cache where the files are actually staged
         if skeleton_dir is None:
             slurm_tmp = os.environ.get("SLURM_TMPDIR", "/tmp")
-            self.skeleton_dir = os.path.join(slurm_tmp, "skeleton")
+            self.skeleton_dir = os.path.join(slurm_tmp, "skeleton_cache")
         else:
             self.skeleton_dir = os.path.normpath(skeleton_dir)
+
+        # FIX 2: Strict safety check. Crash immediately if the folder is missing.
+        if not os.path.exists(self.skeleton_dir):
+            raise FileNotFoundError(
+                f"[!] FATAL: Skeleton directory not found at '{self.skeleton_dir}'. "
+                f"Please ensure your SLURM script copies the files to this exact path."
+            )
 
         self.chunk_data = chunk_data
         
@@ -52,7 +59,6 @@ class NTURGBD_SplitDataset(Dataset):
         ]
         
         # Zero-Shot Unseen Classes (Zero-Indexed for PyTorch)
-        # Using standard trailing classes for 10 or 24 splits
         self.unseen_classes = []
         if self.zsl_classes == 10:
             self.unseen_classes = list(range(110, 120))
@@ -181,6 +187,9 @@ class NTURGBD_SplitDataset(Dataset):
             skel_path = os.path.join(self.skeleton_dir, f"{sample_info['sample_id']}.skeleton")
             
             try:
+                if not os.path.exists(skel_path):
+                    raise FileNotFoundError(f"Missing skeleton file: {skel_path}")
+                    
                 kinematics = self._parse_ntu_skeleton(skel_path)
                 if torch.isnan(kinematics).any() or torch.isinf(kinematics).any():
                     raise ValueError("Corrupted Kinect Sensor: NaN/Inf detected in joints")
@@ -198,21 +207,16 @@ class NTURGBD_SplitDataset(Dataset):
                 return {
                     "sample_id": sample_info['sample_id'],
                     "action_label": sample_info['action'],
-                    "geo_fused": sample_info['geo_fused'],       # Pre-extracted DINOv2+SigLIP Geometry
-                    "sem_global": sample_info['sem_global'],     # Pre-extracted SigLIP Semantics
+                    "geo_fused": sample_info['geo_fused'],
+                    "sem_global": sample_info['sem_global'],
                     "kinematic_streams": torch.stack(physics_streams)
                 }
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Failed to load {skel_path}: {str(e)}")
                 continue
                 
-        # Dummy fallback if all 5 retries fail
-        return {
-            "sample_id": "dummy",
-            "action_label": 0,
-            "geo_fused": torch.zeros((self.num_visual_frames, 576, 1024), dtype=torch.float32),
-            "sem_global": torch.zeros((self.num_visual_frames, 1024), dtype=torch.float32),
-            "kinematic_streams": torch.zeros((self.num_visual_frames, 3, self.window_size, self.max_subjects, self.num_joints, 3), dtype=torch.float32)
-        }
+        # FIX 3: Do not return dummy zeros. Crash loudly if data is actually missing.
+        raise RuntimeError(f"[!] FATAL: Failed to load valid skeleton data after 5 retries. Check if {self.skeleton_dir} is populated.")
 
     def __len__(self):
         return len(self.samples)

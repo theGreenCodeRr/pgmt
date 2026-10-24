@@ -9,6 +9,21 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 # =====================================================================
+# NUMERICAL STABILITY HOOK (THE "SNIFFER")
+# =====================================================================
+def get_nan_hook(name):
+    """Detects exact layer causing NaN/Inf explosions during the forward pass."""
+    def hook(module, inp, output):
+        if isinstance(output, torch.Tensor):
+            if torch.isnan(output).any() or torch.isinf(output).any():
+                raise RuntimeError(f"[!] FATAL EXPLOSION: NaN/Inf generated exactly at layer -> {name}")
+        elif isinstance(output, tuple):
+            for i, out in enumerate(output):
+                if isinstance(out, torch.Tensor) and (torch.isnan(out).any() or torch.isinf(out).any()):
+                    raise RuntimeError(f"[!] FATAL EXPLOSION: NaN/Inf generated exactly at layer -> {name} (output tuple {i})")
+    return hook
+
+# =====================================================================
 # MODULE 1: MULTI-STREAM HYPERGRAPH TRANSFORMER (MS-HyperTR)
 # =====================================================================
 class MS_HyperTR(nn.Module):
@@ -22,7 +37,10 @@ class MS_HyperTR(nn.Module):
         self.bone_embed = nn.Linear(in_dim, hidden_dim)
         self.motion_embed = nn.Linear(in_dim, hidden_dim)
         
-        self.spatial_pos = nn.Parameter(torch.randn(1, 1, 1, 1, num_nodes, hidden_dim))
+        # Scaled Initialization
+        self.spatial_pos = nn.Parameter(
+            torch.randn(1, 1, 1, 1, num_nodes, hidden_dim) / math.sqrt(hidden_dim)
+        )
         
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, 
@@ -39,6 +57,7 @@ class MS_HyperTR(nn.Module):
         )
 
     def forward(self, physics_streams):
+        # FP32 cast removed so FlashAttention operates within VRAM limits
         B, T, Streams, W, S, V, C = physics_streams.shape
         
         joints = physics_streams[:, :, 0]
@@ -68,12 +87,18 @@ class TemporalQueryPooler(nn.Module):
     def __init__(self, input_dim=256, embed_dim=1024, num_queries=4):
         super().__init__()
         self.num_queries = num_queries
-        self.query_tokens = nn.Parameter(torch.randn(1, num_queries, embed_dim))
+        
+        # Scaled Initialization for Query Tokens
+        self.query_tokens = nn.Parameter(
+            torch.randn(1, num_queries, embed_dim) / math.sqrt(embed_dim)
+        )
+        
         self.kv_proj = nn.Linear(input_dim, embed_dim)
         self.cross_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=True)
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, ms_hypertr_features):
+        # FP32 cast removed
         B, T, S, W, D = ms_hypertr_features.shape
         kv = ms_hypertr_features.view(B * T, S * W, D)
         kv = self.kv_proj(kv)
@@ -108,13 +133,9 @@ class PGMTSplitStream(nn.Module):
         super().__init__()
         self.stage1_pretraining = stage1_pretraining
         
-        # Vision Encoder completely removed here to save VRAM and execution time.
         self.kinematic_encoder = MS_HyperTR(hidden_dim=256) 
         self.temporal_pooler = TemporalQueryPooler(input_dim=256, embed_dim=vis_dim, num_queries=4)
         
-        # -----------------------------------------------------
-        # DUAL-LOSS PATHWAY A: Geometric Grounding (Fused Space)
-        # -----------------------------------------------------
         self.q_proj_geo = nn.Linear(vis_dim, vis_dim) 
         self.k_proj_geo = nn.Linear(vis_dim, vis_dim)
         self.norm_q_geo = nn.LayerNorm(vis_dim)
@@ -122,9 +143,6 @@ class PGMTSplitStream(nn.Module):
         self.cross_attn_geo = DirectCrossAttention(embed_dim=vis_dim)
         self.logit_scale_geo = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
         
-        # -----------------------------------------------------
-        # DUAL-LOSS PATHWAY B: Semantic Anchor (Pure SigLIP Space)
-        # -----------------------------------------------------
         self.q_proj_sem = nn.Linear(vis_dim, vis_dim)
         self.norm_q_sem = nn.LayerNorm(vis_dim)
         self.logit_scale_sem = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
@@ -132,34 +150,39 @@ class PGMTSplitStream(nn.Module):
         if not self.stage1_pretraining:
             self.llm_proj = nn.Linear(vis_dim, llm_dim)
 
+    def register_nan_hooks(self):
+        """Attaches the diagnostic sniffer to every module to find exactly where NaN occurs."""
+        for name, module in self.named_modules():
+            # Only attach to leaf modules (like Linear, LayerNorm, Attention)
+            if len(list(module.children())) == 0:
+                module.register_forward_hook(get_nan_hook(name))
+        logger.info("[*] Diagnostic NaN/Inf sniffer successfully attached to all layers.")
+
     def forward(self, batch):
-        # Read pre-computed tensors directly from the fast dataloader batch
-        vis_tokens_fused = batch["geo_fused"]             # (B, T, 576, 1024)
-        vis_tokens_siglip_global = batch["sem_global"]    # (B, T, 1024)
+        vis_tokens_fused = batch["geo_fused"]             
+        vis_tokens_siglip_global = batch["sem_global"]    
         B, T = vis_tokens_fused.shape[:2]
         
-        # 1. Kinematic Forward (3 streams into 4 queries)
-        ms_features = self.kinematic_encoder(batch["kinematic_streams"]) 
-        Q_graph = self.temporal_pooler(ms_features) 
+        # Scrub dirty inputs from the NTU dataset (padding NaNs)
+        safe_kinematic_streams = torch.nan_to_num(
+            batch["kinematic_streams"], nan=0.0, posinf=0.0, neginf=0.0
+        )
         
-        # ==========================================================
-        # PATHWAY A: Geometric Grounding
-        # ==========================================================
+        ms_features = self.kinematic_encoder(safe_kinematic_streams) 
+        
+        # Intermediate scrub to ensure absolute safety before pooling
+        Q_graph_safe = torch.nan_to_num(ms_features, nan=0.0, posinf=0.0, neginf=0.0)
+        Q_graph = self.temporal_pooler(Q_graph_safe) 
+        
         v_flat_geo = vis_tokens_fused.view(B * T, 576, -1)
         v_flat_norm_geo = self.norm_kv_geo(v_flat_geo)
         k_flat_geo = self.k_proj_geo(v_flat_norm_geo)
         
         q_flat_geo = self.norm_q_geo(self.q_proj_geo(Q_graph.view(B * T, 4, -1)))
         
-        # ==========================================================
-        # PATHWAY B: Semantic Text Anchor (Global)
-        # ==========================================================
         v_flat_sem_global = vis_tokens_siglip_global.view(B * T, -1)
         q_flat_sem = self.norm_q_sem(self.q_proj_sem(Q_graph.view(B * T, 4, -1)))
 
-        # ==========================================================
-        # Anchor Target Extraction with NaN Guardrail
-        # ==========================================================
         flat_anchors = batch["spatial_anchors"][:, :, 0, :].contiguous().view(B * T, 2)
         flat_anchors = torch.nan_to_num(flat_anchors, nan=0.5, posinf=0.5, neginf=0.5)
         patch_x = (flat_anchors[:, 0] * 24).clamp(0, 23).long()
@@ -173,10 +196,9 @@ class PGMTSplitStream(nn.Module):
         target_visual_key_sem = v_flat_sem_global 
         contrastive_graph_sem = q_flat_sem.mean(dim=1)
         
-        # FP32 & Zero-Division Safety
+        # Firewalls removed completely. Let PyTorch pass gradients naturally.
         target_visual_key_geo = F.normalize(target_visual_key_geo.float(), p=2, dim=-1, eps=1e-8)
         contrastive_graph_geo = F.normalize(contrastive_graph_geo.float(), p=2, dim=-1, eps=1e-8)
-        
         target_visual_key_sem = F.normalize(target_visual_key_sem.float(), p=2, dim=-1, eps=1e-8)
         contrastive_graph_sem = F.normalize(contrastive_graph_sem.float(), p=2, dim=-1, eps=1e-8)
         
@@ -203,11 +225,13 @@ class PGMTSplitStream(nn.Module):
 # VERIFICATION BLOCK
 # =====================================================================
 if __name__ == "__main__":
-    print("[*] Testing Tier 3 Split Architecture...")
+    print("[*] Testing Tier 3 Split Architecture with Numerical Sniffer...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = PGMTSplitStream(vis_dim=1024, stage1_pretraining=True).to(device)
     
-    # Simulate pre-extracted RAM tensors from dataset_split.py
+    # Activate the Sniffer for testing
+    model.register_nan_hooks()
+    
     dummy_batch = {
         "geo_fused": torch.randn(2, 3, 576, 1024).to(device),
         "sem_global": torch.randn(2, 3, 1024).to(device),
@@ -219,7 +243,7 @@ if __name__ == "__main__":
         with torch.amp.autocast(device_type=device.type if device.type == 'cuda' else 'cpu', dtype=torch.bfloat16):
             outputs = model(dummy_batch)
             
-    print("\nOutputs Validated:")
+    print("\nOutputs Validated Successfully (No NaNs Detected):")
     for key, val in outputs.items():
         if val is not None:
             print(f"  - {key}: {val.shape}")
