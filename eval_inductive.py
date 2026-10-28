@@ -27,7 +27,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def load_model_weights(model, checkpoint_path):
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    # FIX: Safely extract ONLY the 'model' dictionary from the new 125MB resume-ready checkpoints
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    
+    # Check if it's a nested dictionary (new format) or flat weights (old format)
+    state_dict = checkpoint.get('model', checkpoint)
+    
     clean_state_dict = {}
     for k, v in state_dict.items():
         clean_k = k.replace('_orig_mod.', '', 1).replace('module.', '', 1)
