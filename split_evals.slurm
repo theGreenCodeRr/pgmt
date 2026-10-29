@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=Split_Eval_Fast
+#SBATCH --job-name=Split_Eval
 #SBATCH --partition=d
 #SBATCH --nodelist=imawaka
 #SBATCH --gres=gpu:1
@@ -39,28 +39,28 @@ echo "[*] Local staging verified and complete!"
 # ==========================================
 echo "[*] Launching X-Sub Inductive Evaluation (k-NN & Linear Probe)"
 python eval_inductive.py --protocol xsub \
-    --checkpoint /pnr/lab/nurul/PGMT_Code/checkpoints_retrain/xsub_zsl0/epoch_170.pth \
+    --checkpoint /pnr/lab/nurul/PGMT_Code/checkpoints_retrain/xsub_zsl0/epoch_240.pth \
     --skeleton_dir $LOCAL_SKEL_DIR \
     --offline_features_dir $LOCAL_PT_DIR
 
 echo "[*] Launching X-Set Inductive Evaluation (k-NN & Linear Probe)"
 python eval_inductive.py --protocol xset \
-    --checkpoint /pnr/lab/nurul/PGMT_Code/checkpoints_retrain/xset_zsl0/epoch_170.pth \
+    --checkpoint /pnr/lab/nurul/PGMT_Code/checkpoints_retrain/xset_zsl0/epoch_233.pth \
     --skeleton_dir $LOCAL_SKEL_DIR \
     --offline_features_dir $LOCAL_PT_DIR
 
 # ==========================================
-# 2. Zero-Shot Alignment Evaluations (COMMENTED OUT FOR NOW)
+# 2. Zero-Shot Alignment Evaluations
 # ==========================================
 # echo "[*] Launching 110/10 Zero-Shot Evaluation"
 # python eval_zeroshot_splits.py --split_type 110_10 \
-#     --checkpoint /pnr/lab/nurul/PGMT_Code/checkpoints_retrain/xsub_zsl10/epoch_170.pth \
+#     --checkpoint /pnr/lab/nurul/PGMT_Code/checkpoints_retrain/xsub_zsl10/epoch_250.pth \
 #     --skeleton_dir $LOCAL_SKEL_DIR \
 #     --offline_features_dir $LOCAL_PT_DIR
 #
 # echo "[*] Launching 96/24 Zero-Shot Evaluation"
 # python eval_zeroshot_splits.py --split_type 96_24 \
-#     --checkpoint /pnr/lab/nurul/PGMT_Code/checkpoints_retrain/xsub_zsl24/epoch_170.pth \
+#     --checkpoint /pnr/lab/nurul/PGMT_Code/checkpoints_retrain/xsub_zsl24/epoch_250.pth \
 #     --skeleton_dir $LOCAL_SKEL_DIR \
 #     --offline_features_dir $LOCAL_PT_DIR
 
